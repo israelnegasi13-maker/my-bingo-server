@@ -1,8 +1,9 @@
 {
   "name": "bingo-multiplayer-server",
   "version": "1.0.0",
-  "description": "Bingo Server for Render",
-  "main": "server.js",
+  "engines": {
+    "node": ">=14.0.0"
+  },
   "scripts": {
     "start": "node server.js"
   },
