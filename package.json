@@ -1,5 +1,5 @@
 {
-  "name": "bingo-elite-server",
+  "name": "bingo-elite-backend",
   "version": "1.0.0",
   "description": "Real-time Bingo backend for Telegram Mini App supporting 2-50 players.",
   "main": "server.js",
