@@ -1,14 +1,13 @@
 {
-  "name": "prime-bingo-server",
+  "name": "bingo-server",
   "version": "1.0.0",
-  "description": "Bingo Server with Box-Specific Stake Rooms",
+  "description": "Premium Bingo Server for Telegram Mini App",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
-    "express": "^4.19.2",
+    "express": "^4.18.2",
     "socket.io": "^4.7.2"
   }
 }
