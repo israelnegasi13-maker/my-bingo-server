@@ -1,24 +1,20 @@
 {
-  "name": "bingo-elite-backend",
+  "name": "bingo-elite-server",
   "version": "1.0.0",
-  "description": "Real-time Bingo backend for Telegram Mini App with multi-room support and auto-reset logic.",
+  "description": "Real-time backend for Bingo Elite challenge with Admin control",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "node --watch server.js"
+    "dev": "nodemon server.js"
   },
-  "keywords": [
-    "bingo",
-    "socket.io",
-    "telegram-mini-app",
-    "multiplayer",
-    "real-time"
-  ],
-  "author": "",
-  "license": "ISC",
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.18.2",
     "socket.io": "^4.7.2"
-  }
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "author": "",
+  "license": "ISC"
 }
