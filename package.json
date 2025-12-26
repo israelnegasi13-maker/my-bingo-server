@@ -1,7 +1,7 @@
 {
   "name": "bingo-elite-server",
   "version": "1.0.0",
-  "description": "Real-time backend for Bingo Elite challenge with Admin control",
+  "description": "Real-time backend for Bingo Elite challenge with Admin control and revenue tracking",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
