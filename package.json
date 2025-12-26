@@ -1,13 +1,25 @@
 {
-  "name": "bingo-server",
+  "name": "bingo-elite-server",
   "version": "1.0.0",
-  "description": "Premium Bingo Server for Telegram Mini App",
+  "description": "Real-time backend for Bingo Elite Telegram Mini App",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
+  "keywords": [
+    "bingo",
+    "telegram",
+    "socketio",
+    "multiplayer"
+  ],
+  "author": "Elite Developer",
+  "license": "ISC",
   "dependencies": {
     "express": "^4.18.2",
     "socket.io": "^4.7.2"
+  },
+  "engines": {
+    "node": ">=14.0.0"
   }
 }
