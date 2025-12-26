@@ -1,162 +1,167 @@
-const express = require('express');
-const http = require('http');
-const { Server } = require('socket.io');
+const { createServer } = require("http");
+const { Server } = require("socket.io");
 
-const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*",
-        methods: ["GET", "POST"]
-    }
+const httpServer = createServer();
+const io = new Server(httpServer, {
+  cors: { origin: "*" }
 });
 
-// Arena state management
-const arenas = {
-    10: { status: 'Lobby', takenBoxes: [], ballsDrawn: [], players: [], timer: null },
-    20: { status: 'Lobby', takenBoxes: [], ballsDrawn: [], players: [], timer: null },
-    50: { status: 'Lobby', takenBoxes: [], ballsDrawn: [], players: [], timer: null },
-    100: { status: 'Lobby', takenBoxes: [], ballsDrawn: [], players: [], timer: null }
-};
+// Game Configurations
+const TAX_RATE = 0.10; // 10% fee
+const MIN_PLAYERS = 2;
+const LOBBY_TIME = 15; // seconds to wait once 2 players join
 
-io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+let rooms = {}; 
+// Structure: rooms[stake] = { 
+//   players: [{id, name, box}], 
+//   status: 'lobby' | 'playing', 
+//   timer: 15, 
+//   drawnBalls: [],
+//   interval: null 
+// }
 
-    // Send status of all arenas on request
-    socket.on('getRoomsStatus', () => {
-        const busyRooms = Object.keys(arenas)
-            .filter(id => arenas[id].status === 'Playing')
-            .map(Number);
-        socket.emit('roomsStatusUpdate', busyRooms);
+io.on("connection", (socket) => {
+  console.log("User connected:", socket.id);
+
+  socket.on("getRoomsStatus", () => {
+    const busyRooms = Object.keys(rooms).filter(r => rooms[r].status === 'playing').map(Number);
+    socket.emit("roomsStatusUpdate", busyRooms);
+  });
+
+  socket.on("joinRoom", (data) => {
+    const { room, box, userName } = data; // room is the stake (10, 20, etc)
+
+    if (!rooms[room]) {
+      rooms[room] = { 
+        players: [], 
+        status: 'lobby', 
+        timer: LOBBY_TIME, 
+        drawnBalls: [],
+        interval: null 
+      };
+    }
+
+    if (rooms[room].status === 'playing') {
+        socket.emit("error", "Arena already in session");
+        return;
+    }
+
+    rooms[room].players.push({ id: socket.id, name: userName, box });
+    socket.join(`room-${room}`);
+
+    console.log(`${userName} joined ${room} ETB Arena`);
+
+    // Notify everyone in the lobby of the new player count
+    io.to(`room-${room}`).emit("lobbyUpdate", { 
+      room, 
+      count: rooms[room].players.length 
     });
 
-    // Check if a box is taken
-    socket.on('getTakenBoxes', (data, callback) => {
-        const arena = arenas[data.room];
-        if (arena) {
-            callback(arena.takenBoxes);
-        }
-    });
+    // Start countdown if we hit the minimum requirement
+    if (rooms[room].players.length >= MIN_PLAYERS && !rooms[room].interval) {
+        startLobbyCountdown(room);
+    }
+  });
 
-    socket.on('checkBoxAvailability', (data, callback) => {
-        const arena = arenas[data.room];
-        if (!arena || arena.status === 'Playing') {
-            return callback({ available: false });
-        }
-        const isTaken = arena.takenBoxes.includes(data.box);
-        callback({ available: !isTaken });
-    });
+  socket.on("claimBingo", (data) => {
+    const { room, grid, marked } = data;
+    const game = rooms[room];
+    if (!game || game.status !== 'playing') return;
 
-    // Join Arena
-    socket.on('joinRoom', (data) => {
-        const arena = arenas[data.room];
-        if (!arena || arena.status === 'Playing') return;
+    // Server-side validation
+    const isWinner = validateBingo(grid, marked, game.drawnBalls);
 
-        socket.join(data.room);
-        arena.players.push({ id: socket.id, name: data.userName, box: data.box });
-        arena.takenBoxes.push(data.box);
-
-        // Broadcast updated taken boxes to everyone in lobby for this room
-        io.emit('boxUpdate', { room: data.room, takenBoxes: arena.takenBoxes });
-
-        // Start 15s countdown when the first player joins
-        if (arena.players.length === 1 && !arena.timer) {
-            startCountdown(data.room);
-        }
-    });
-
-    // Handle Bingo Claim
-    socket.on('claimBingo', (data) => {
-        const arena = arenas[data.room];
-        if (!arena || arena.status !== 'Playing') return;
-
-        // In a production app, you would validate the 'grid' and 'marked' numbers here
-        // For now, first claim wins
-        const winner = arena.players.find(p => p.id === socket.id);
-        const prize = data.room * arena.players.length * 0.9; // 10% House edge
-
-        io.to(data.room).emit('gameOver', {
-            room: data.room,
+    if (isWinner) {
+        const totalPool = room * game.players.length;
+        const prize = totalPool * (1 - TAX_RATE); // Deduct 10% tax
+        
+        io.to(`room-${room}`).emit("gameOver", {
+            room,
             winnerId: socket.id,
-            winnerName: winner ? winner.name : "Elite Player",
-            prize: prize
+            winnerName: game.players.find(p => p.id === socket.id).name,
+            prize: prize,
+            taxDeducted: totalPool * TAX_RATE
         });
 
-        resetArena(data.room);
-    });
+        // Clean up room
+        clearInterval(game.interval);
+        delete rooms[room];
+        io.emit("roomsStatusUpdate", Object.keys(rooms).filter(r => rooms[r].status === 'playing').map(Number));
+    }
+  });
 
-    socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
-    });
+  socket.on("disconnect", () => {
+    // Cleanup logic for disconnected users in lobby
+    for (let r in rooms) {
+      rooms[r].players = rooms[r].players.filter(p => p.id !== socket.id);
+      io.to(`room-${r}`).emit("lobbyUpdate", { room: r, count: rooms[r].players.length });
+    }
+  });
 });
 
-function startCountdown(roomId) {
-    const arena = arenas[roomId];
-    let count = 15;
+function startLobbyCountdown(room) {
+    const game = rooms[room];
+    game.interval = setInterval(() => {
+        game.timer--;
+        io.to(`room-${room}`).emit("gameCountdown", { room, timer: game.timer });
 
-    arena.timer = setInterval(() => {
-        count--;
-        if (count <= 0) {
-            clearInterval(arena.timer);
-            arena.status = 'Playing';
-            
-            // Tell everyone globally that this room is now busy
-            const busyRooms = Object.keys(arenas).filter(id => arenas[id].status === 'Playing').map(Number);
-            io.emit('roomsStatusUpdate', busyRooms);
-            
-            startGameLoop(roomId);
+        if (game.timer <= 0) {
+            clearInterval(game.interval);
+            startGameLoop(room);
         }
     }, 1000);
 }
 
-function startGameLoop(roomId) {
-    const arena = arenas[roomId];
-    
-    const gameInterval = setInterval(() => {
-        // Stop if room was reset (someone won) or 75 balls reached
-        if (arena.status === 'Lobby') {
-            clearInterval(gameInterval);
+function startGameLoop(room) {
+    const game = rooms[room];
+    game.status = 'playing';
+    io.emit("roomsStatusUpdate", Object.keys(rooms).filter(r => rooms[r].status === 'playing').map(Number));
+
+    const allBalls = Array.from({length: 75}, (_, i) => i + 1);
+    const shuffled = allBalls.sort(() => Math.random() - 0.5);
+
+    game.interval = setInterval(() => {
+        if (shuffled.length === 0) {
+            clearInterval(game.interval);
             return;
         }
-
-        if (arena.ballsDrawn.length >= 75) {
-            clearInterval(gameInterval);
-            io.to(roomId).emit('gameOver', { room: roomId, winnerId: null, winnerName: "House", prize: 0 });
-            resetArena(roomId);
-            return;
-        }
-
-        // Generate unique ball 1-75
-        let ball;
-        do {
-            ball = Math.floor(Math.random() * 75) + 1;
-        } while (arena.ballsDrawn.includes(ball));
-
-        arena.ballsDrawn.push(ball);
-        io.to(roomId).emit('ballDrawn', { room: roomId, num: ball });
-
-    }, 4000); // New ball every 4 seconds
+        const ball = shuffled.pop();
+        game.drawnBalls.push(ball);
+        io.to(`room-${room}`).emit("ballDrawn", { room, num: ball });
+    }, 4000); // Draw every 4 seconds
 }
 
-function resetArena(roomId) {
-    const arena = arenas[roomId];
-    if (arena.timer) clearInterval(arena.timer);
-    
-    arenas[roomId] = {
-        status: 'Lobby',
-        takenBoxes: [],
-        ballsDrawn: [],
-        players: [],
-        timer: null
-    };
+function validateBingo(grid, marked, drawnBalls) {
+    // 1. Ensure all marked numbers were actually drawn
+    const validMarks = marked.every(num => num === 'FREE' || drawnBalls.includes(num));
+    if (!validMarks) return false;
 
-    // Broadcast that room is now open
-    const busyRooms = Object.keys(arenas).filter(id => arenas[id].status === 'Playing').map(Number);
-    io.emit('roomsStatusUpdate', busyRooms);
-    io.emit('boxUpdate', { room: roomId, takenBoxes: [] });
+    // 2. Convert grid to 2D for pattern checking
+    const rows = [];
+    for (let i = 0; i < 25; i += 5) rows.push(grid.slice(i, i + 5));
+
+    // Check rows
+    for (let row of rows) {
+        if (row.every(cell => marked.includes(cell))) return true;
+    }
+
+    // Check columns
+    for (let col = 0; col < 5; col++) {
+        let count = 0;
+        for (let row = 0; row < 5; row++) {
+            if (marked.includes(rows[row][col])) count++;
+        }
+        if (count === 5) return true;
+    }
+
+    // Check diagonals
+    const diag1 = [rows[0][0], rows[1][1], rows[2][2], rows[3][3], rows[4][4]];
+    const diag2 = [rows[0][4], rows[1][3], rows[2][2], rows[3][1], rows[4][0]];
+    if (diag1.every(cell => marked.includes(cell))) return true;
+    if (diag2.every(cell => marked.includes(cell))) return true;
+
+    return false;
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Bingo Server running on port ${PORT}`);
-});
+httpServer.listen(PORT, () => console.log(`Server running on port ${PORT}`));
