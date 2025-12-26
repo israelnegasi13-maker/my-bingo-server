@@ -1,113 +1,126 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
+const express = require('express');
+const http = require('http');
+const { Server } = require('socket.io');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*" }
+    cors: { origin: "*" } // Adjust for production security
 });
 
-/* ===============================
-   GLOBAL STATE
-================================= */
+// --- Game State Memory ---
+// In a real production app, use Redis or a Database.
+const rooms = {
+    "10": { players: [], takenBoxes: [], balls: [], status: "waiting", timer: 30 },
+    "50": { players: [], takenBoxes: [], balls: [], status: "waiting", timer: 30 },
+    "100": { players: [], takenBoxes: [], balls: [], status: "waiting", timer: 30 }
+};
 
-const players = new Map();     // socket.id -> { id, name, balance }
-const bannedIPs = new Set();   // banned IP addresses
+const allPlayers = new Map(); // Global tracking for Admin Panel
 
-/* ===============================
-   SOCKET HANDLER
-================================= */
+io.on('connection', (socket) => {
+    console.log(`User connected: ${socket.id}`);
 
-io.on("connection", (socket) => {
-
-    const ip = socket.handshake.address;
-
-    /* ---- BAN CHECK ---- */
-    if (bannedIPs.has(ip)) {
-        socket.disconnect(true);
-        return;
-    }
-
-    /* ---- ROLE ---- */
+    // Identify role (Admin or Player)
     const isAdmin = socket.handshake.auth?.role === "admin";
 
-    /* ---- REGISTER PLAYER ---- */
-    if (!isAdmin) {
-        const userName =
-            socket.handshake.auth?.name ||
-            socket.handshake.query?.name ||
-            "PLAYER";
+    // 1. INITIAL DATA SYNC
+    if (isAdmin) {
+        socket.emit('admin:players', Array.from(allPlayers.values()));
+    }
 
-        players.set(socket.id, {
+    // 2. PLAYER LOGIC: Request taken boxes for a specific stake
+    socket.on('getTakenBoxes', (stake) => {
+        const room = rooms[stake];
+        if (room) {
+            socket.emit('boxStatus', room.takenBoxes);
+        }
+    });
+
+    // 3. PLAYER LOGIC: Join Room after picking a box
+    socket.on('joinRoom', (data) => {
+        const { room: stake, box, userName } = data;
+        const room = rooms[stake];
+
+        if (!room) return;
+        
+        // Prevent double booking a box
+        if (room.takenBoxes.includes(box)) {
+            return socket.emit('error', 'Box already taken');
+        }
+
+        // Add player to room and global list
+        const playerData = {
             id: socket.id,
             name: userName,
-            balance: 0
-        });
+            balance: 0, // In reality, fetch from DB
+            stake: stake,
+            box: box
+        };
 
-        socket.emit("balanceUpdate", 0);
-        updateAdmins();
-    }
+        room.players.push(playerData);
+        room.takenBoxes.push(box);
+        allPlayers.set(socket.id, playerData);
 
-    /* ===============================
-       GAME EVENTS (EXISTING)
-       Your current game logic stays
-       exactly the same below this
-    ================================= */
+        socket.join(stake);
+        
+        // Notify all players in that lobby of the updated boxes
+        io.to(stake).emit('boxStatus', room.takenBoxes);
+        
+        // Update Admin Panel
+        io.emit('admin:players', Array.from(allPlayers.values()));
 
-    socket.on("disconnect", () => {
-        players.delete(socket.id);
-        updateAdmins();
+        console.log(`${userName} joined ${stake} ETB room at box ${box}`);
     });
 
-    /* ===============================
-       ADMIN EVENTS
-    ================================= */
-
-    if (isAdmin) {
-        socket.emit("admin:players", Array.from(players.values()));
-    }
-
-    socket.on("admin:addFunds", ({ playerId, amount }) => {
+    // 4. ADMIN LOGIC: Handle Fund Additions
+    socket.on('addFunds', (data) => {
         if (!isAdmin) return;
-
-        const p = players.get(playerId);
-        if (!p || amount <= 0) return;
-
-        p.balance += amount;
-
-        io.to(playerId).emit("balanceUpdate", p.balance);
-        updateAdmins();
+        const player = allPlayers.get(data.playerId);
+        if (player) {
+            player.balance += data.amount;
+            // Update the specific player and refresh the admin list
+            io.to(data.playerId).emit('balanceUpdate', player.balance);
+            io.emit('admin:players', Array.from(allPlayers.values()));
+        }
     });
 
-    socket.on("admin:banPlayer", ({ playerId }) => {
-        if (!isAdmin) return;
-
-        const target = io.sockets.sockets.get(playerId);
-        if (!target) return;
-
-        bannedIPs.add(target.handshake.address);
-        target.disconnect(true);
-
-        players.delete(playerId);
-        updateAdmins();
+    // 5. DISCONNECT LOGIC
+    socket.on('disconnect', () => {
+        const player = allPlayers.get(socket.id);
+        if (player) {
+            const room = rooms[player.stake];
+            if (room) {
+                room.players = room.players.filter(p => p.id !== socket.id);
+                room.takenBoxes = room.takenBoxes.filter(b => b !== player.box);
+                io.to(player.stake).emit('boxStatus', room.takenBoxes);
+            }
+            allPlayers.delete(socket.id);
+            io.emit('admin:players', Array.from(allPlayers.values()));
+        }
     });
-
 });
 
-/* ===============================
-   ADMIN UPDATE HELPER
-================================= */
+// Game Loop: Simple 1-second interval to handle room timers
+setInterval(() => {
+    for (const stake in rooms) {
+        const room = rooms[stake];
+        if (room.players.length > 0 && room.status === "waiting") {
+            room.timer--;
+            io.to(stake).emit('gameCountdown', { room: stake, timer: room.timer });
 
-function updateAdmins() {
-    io.emit("admin:players", Array.from(players.values()));
+            if (room.timer <= 0) {
+                room.status = "playing";
+                startGame(stake);
+            }
+        }
+    }
+}, 1000);
+
+function startGame(stake) {
+    console.log(`Game starting for ${stake} ETB room!`);
+    // Logic to start drawing balls would go here...
 }
 
-/* ===============================
-   SERVER START
-================================= */
-
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Bingo Elite Server running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
