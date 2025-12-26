@@ -4,196 +4,230 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
-
-// Essential: Enable CORS so your Telegram frontend can talk to this server
 app.use(cors());
 
 const server = http.createServer(app);
 const io = new Server(server, {
     cors: {
-        origin: "*", // Allows any origin to connect
+        origin: "*",
         methods: ["GET", "POST"]
     }
 });
 
-// Game state storage
-const rooms = {};
+// --- CONFIGURATION ---
+const ADMIN_SECRET_KEY = "YOUR_ADMIN_SECRET_KEY"; // Change this to match admin.html
+const HOUSE_TAX = 0.10; // 10% House commission
 
-/**
- * Creates a fresh state for a specific stake room
- */
-const createRoomState = (stake) => ({
-    stake,
-    players: [],
-    takenBoxes: [], // Tracks which ticket numbers (1-50) are currently occupied
-    calledNumbers: [],
-    availableNumbers: Array.from({ length: 75 }, (_, i) => i + 1),
-    status: 'LOBBY', 
-    timer: 10,
-    interval: null
-});
+// --- GAME STATE ---
+let players = {}; // { socketId: { name, balance, status, room, box } }
+let rooms = {};   // { roomType: { players: [], balls: [], interval, timer, status } }
+let bannedPlayers = new Set(); 
+let houseRevenue = 0;
+
+// Helper to update admin dashboard
+const broadcastAdminData = () => {
+    const adminData = {
+        stats: {
+            totalPlayers: Object.keys(players).length,
+            activeRooms: Object.keys(rooms).length,
+            revenue: houseRevenue
+        },
+        players: Object.values(players).map(p => ({
+            id: p.id,
+            name: p.name,
+            balance: p.balance,
+            status: bannedPlayers.has(p.id) ? 'banned' : 'active'
+        }))
+    };
+    io.to('admin_room').emit('admin_data_update', adminData);
+};
 
 io.on('connection', (socket) => {
-    console.log('User Connected:', socket.id);
+    console.log('User connected:', socket.id);
 
-    // 1. Send currently locked boxes to the user so they can't pick them
-    socket.on('getTakenBoxes', ({ room }, callback) => {
-        if (!rooms[room]) rooms[room] = createRoomState(room);
-        callback(rooms[room].takenBoxes);
-    });
+    // 1. Initial Player Setup
+    players[socket.id] = {
+        id: socket.id,
+        name: "Guest",
+        balance: 0.00, // Default balance 0 as requested
+        status: 'active',
+        room: null
+    };
 
-    // 2. Handle joining a specific stake room and selecting a box
-    socket.on('joinRoom', ({ room, box, userName }) => {
-        if (!rooms[room]) rooms[room] = createRoomState(room);
-        const currentRoom = rooms[room];
+    // 2. Admin Authentication
+    if (socket.handshake.auth && socket.handshake.auth.token === ADMIN_SECRET_KEY) {
+        socket.join('admin_room');
+        console.log('Admin connected:', socket.id);
+    }
 
-        // Block entry if game is already running or box is already picked by someone else
-        if (currentRoom.status === 'PLAYING' || currentRoom.takenBoxes.includes(box)) {
-            return;
+    // --- PLAYER ACTIONS ---
+
+    socket.on('joinRoom', (data) => {
+        // Check if banned
+        if (bannedPlayers.has(socket.id)) {
+            socket.emit('error', 'You are banned from this server.');
+            return socket.disconnect();
+        }
+
+        const { room, box, userName } = data;
+        players[socket.id].name = userName;
+        players[socket.id].room = room;
+        players[socket.id].box = box;
+
+        // Deduction logic would happen here if balance >= room
+        // For now, let's assume client handles initial check, server confirms
+        if (players[socket.id].balance < room) {
+            return; // Client-side already prevents this
         }
 
         socket.join(`room_${room}`);
         
-        const player = {
-            id: socket.id,
-            userName,
-            box,
-            markedNumbers: ['FREE']
-        };
+        if (!rooms[room]) {
+            rooms[room] = { players: [], balls: [], status: 'waiting', timer: 10 };
+        }
+        
+        rooms[room].players.push(socket.id);
 
-        currentRoom.players.push(player);
-        currentRoom.takenBoxes.push(box);
-
-        io.to(`room_${room}`).emit('lobbyUpdate', {
-            room,
-            count: currentRoom.players.length
+        // Notify lobby
+        io.to(`room_${room}`).emit('lobbyUpdate', { 
+            room: room, 
+            count: rooms[room].players.length 
         });
 
-        // Auto-start countdown when 2 or more players are present in the lobby
-        if (currentRoom.players.length >= 2 && currentRoom.status === 'LOBBY') {
-            startCountdown(room);
+        // Start countdown if 2+ players
+        if (rooms[room].players.length >= 2 && rooms[room].status === 'waiting') {
+            startRoomCountdown(room);
         }
+        
+        broadcastAdminData();
     });
 
-    // 3. Bingo Claim Validation
-    socket.on('claimBingo', ({ room, grid, marked }) => {
-        const currentRoom = rooms[room];
-        if (!currentRoom || currentRoom.status !== 'PLAYING') return;
-
-        // Verify that every number the user marked was actually drawn by the server
-        const isValid = marked.every(num => 
-            num === 'FREE' || currentRoom.calledNumbers.includes(num)
-        );
-
-        if (isValid) {
-            const player = currentRoom.players.find(p => p.id === socket.id);
-            endGame(room, socket.id, player ? player.userName : "Unknown Player");
-        }
+    socket.on('getTakenBoxes', (data, callback) => {
+        const room = data.room;
+        const taken = Object.values(players)
+            .filter(p => p.room === room)
+            .map(p => p.box);
+        callback(taken);
     });
 
-    // 4. Handle Disconnection
-    socket.on('disconnect', () => {
-        for (const roomId in rooms) {
-            const room = rooms[roomId];
-            const playerIndex = room.players.findIndex(p => p.id === socket.id);
-            if (playerIndex !== -1) {
-                const player = room.players[playerIndex];
-                // If the game hasn't started yet, unlock their box immediately for others
-                if (room.status === 'LOBBY') {
-                    room.takenBoxes = room.takenBoxes.filter(b => b !== player.box);
-                }
-                room.players.splice(playerIndex, 1);
-                io.to(`room_${roomId}`).emit('lobbyUpdate', {
-                    room: roomId,
-                    count: room.players.length
-                });
+    socket.on('claimBingo', (data) => {
+        const { room } = data;
+        const roomData = rooms[room];
+        if (!roomData || roomData.status !== 'playing') return;
+
+        // Game Over Logic
+        roomData.status = 'finished';
+        clearInterval(roomData.interval);
+
+        const totalPot = room * roomData.players.length;
+        const tax = totalPot * HOUSE_TAX;
+        const winnerPrize = totalPot - tax;
+        houseRevenue += tax;
+
+        // Update Winner Balance
+        players[socket.id].balance += winnerPrize;
+
+        io.to(`room_${room}`).emit('gameOver', {
+            room: room,
+            winnerId: socket.id,
+            winnerName: players[socket.id].name,
+            prize: winnerPrize
+        });
+
+        // Update balances for everyone
+        roomData.players.forEach(pId => {
+            if (players[pId]) {
+                io.to(pId).emit('balanceUpdate', players[pId].balance);
             }
+        });
+
+        // Clean up room
+        setTimeout(() => delete rooms[room], 5000);
+        broadcastAdminData();
+    });
+
+    // --- ADMIN ACTIONS ---
+
+    socket.on('admin_get_data', () => {
+        broadcastAdminData();
+    });
+
+    socket.on('admin_modify_balance', (data) => {
+        const { playerId, amount } = data;
+        if (players[playerId]) {
+            players[playerId].balance += amount;
+            io.to(playerId).emit('balanceUpdate', players[playerId].balance);
+            broadcastAdminData();
         }
+    });
+
+    socket.on('admin_toggle_ban', (data) => {
+        const { playerId, ban } = data;
+        if (ban) {
+            bannedPlayers.add(playerId);
+            if (players[playerId]) {
+                io.to(playerId).emit('error', 'You have been banned.');
+                const s = io.sockets.sockets.get(playerId);
+                if (s) s.disconnect();
+            }
+        } else {
+            bannedPlayers.delete(playerId);
+        }
+        broadcastAdminData();
+    });
+
+    socket.on('disconnect', () => {
+        delete players[socket.id];
+        broadcastAdminData();
     });
 });
 
-/**
- * Handles the 10-second countdown before a match starts
- */
-function startCountdown(stake) {
-    const room = rooms[stake];
-    if (room.status !== 'LOBBY') return;
+// --- GAME LOOP LOGIC ---
+
+function startRoomCountdown(roomType) {
+    const room = rooms[roomType];
+    room.status = 'counting';
     
-    room.status = 'COUNTDOWN';
-    room.timer = 10;
-
     const countInterval = setInterval(() => {
-        io.to(`room_${stake}`).emit('gameCountdown', {
-            room: stake,
-            timer: room.timer
-        });
-
+        room.timer--;
+        io.to(`room_${roomType}`).emit('gameCountdown', { room: roomType, timer: room.timer });
+        
         if (room.timer <= 0) {
             clearInterval(countInterval);
-            startGame(stake);
+            startGame(roomType);
         }
-        room.timer--;
     }, 1000);
 }
 
-/**
- * Starts the game loop drawing balls every 4 seconds
- */
-function startGame(stake) {
-    const room = rooms[stake];
-    room.status = 'PLAYING';
+function startGame(roomType) {
+    const room = rooms[roomType];
+    room.status = 'playing';
+    room.balls = [];
     
-    // Server-side randomization of balls (Fisher-Yates style shuffle)
-    room.availableNumbers.sort(() => Math.random() - 0.5);
+    // Deduct entry fee from all players
+    room.players.forEach(pId => {
+        if (players[pId]) {
+            players[pId].balance -= roomType;
+            io.to(pId).emit('balanceUpdate', players[pId].balance);
+        }
+    });
 
     room.interval = setInterval(() => {
-        // HOUSE WINS: If all 75 numbers are drawn and no player has claimed Bingo
-        if (room.availableNumbers.length === 0) {
-            endGame(stake, 'HOUSE', 'THE ARENA');
+        if (room.balls.length >= 75) {
+            clearInterval(room.interval);
+            io.to(`room_${roomType}`).emit('gameOver', { winnerId: 'HOUSE' });
             return;
         }
 
-        const drawn = room.availableNumbers.pop();
-        room.calledNumbers.push(drawn);
-        
-        io.to(`room_${stake}`).emit('ballDrawn', {
-            room: stake,
-            num: drawn
-        });
+        let ball;
+        do {
+            ball = Math.floor(Math.random() * 75) + 1;
+        } while (room.balls.includes(ball));
 
-    }, 4000); // 4-second delay between balls
-}
-
-/**
- * Ends the match, announces winner, and handles state reset
- */
-function endGame(stake, winnerId, winnerName) {
-    const room = rooms[stake];
-    if (!room || room.status === 'FINISHED') return;
-    
-    clearInterval(room.interval);
-    room.status = 'FINISHED';
-
-    // Calculate prize pool (Total stakes minus a 10% house fee)
-    const totalPool = room.stake * room.players.length;
-    const prize = winnerId === 'HOUSE' ? 0 : totalPool * 0.9;
-
-    io.to(`room_${stake}`).emit('gameOver', {
-        room: stake,
-        winnerId,
-        winnerName,
-        prize
-    });
-
-    // AUTO-RESET: Wipe the room memory after 7 seconds
-    // This unlocks all boxes and clears history for the next set of players
-    setTimeout(() => {
-        console.log(`Match finished in room ${stake}. Resetting and opening all boxes.`);
-        rooms[stake] = createRoomState(stake);
-    }, 7000); 
+        room.balls.push(ball);
+        io.to(`room_${roomType}`).emit('ballDrawn', { room: roomType, num: ball });
+    }, 4000);
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    console.log(`Bingo Elite Server is live on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Bingo Server running on port ${PORT}`));
