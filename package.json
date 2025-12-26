@@ -1,14 +1,14 @@
 {
-  "name": "bingo-multiplayer-server",
-  "version": "1.0.0",
-  "engines": {
-    "node": ">=14.0.0"
-  },
-  "scripts": {
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.7.2"
-  }
+"name": "prime-bingo-server",
+"version": "1.0.0",
+"description": "Bingo Server with Stake Rooms and CORS support",
+"main": "server.js",
+"scripts": {
+"start": "node server.js"
+},
+"dependencies": {
+"cors": "^2.8.5",
+"express": "^4.19.2",
+"socket.io": "^4.7.2"
+}
 }
