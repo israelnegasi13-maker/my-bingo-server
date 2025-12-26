@@ -1,7 +1,7 @@
 {
   "name": "bingo-elite-server",
   "version": "1.0.0",
-  "description": "Multiplayer Bingo Server with Admin Controls",
+  "description": "Real-time backend for Bingo Elite using Express and Socket.io",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -12,6 +12,18 @@
     "express": "^4.18.2",
     "socket.io": "^4.7.2"
   },
-  "author": "",
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "keywords": [
+    "bingo",
+    "socket.io",
+    "realtime",
+    "game-server"
+  ],
+  "author": "Elite Ops",
   "license": "ISC"
 }
