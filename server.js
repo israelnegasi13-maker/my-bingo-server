@@ -4,137 +4,172 @@ const { Server } = require('socket.io');
 const cors = require('cors');
 
 const app = express();
-
-// Apply CORS middleware for Express
 app.use(cors());
 
 const server = http.createServer(app);
-
-// Apply CORS configuration for Socket.io
 const io = new Server(server, {
-    cors: { 
-        origin: "*", 
-        methods: ["GET", "POST"] 
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
     }
 });
 
-// State management for rooms
+/**
+ * State Management
+ * rooms: { 
+ * [stakeAmount]: { 
+ * players: { socketId: { id, name, box } }, 
+ * takenBoxes: [number], 
+ * drawing: boolean, 
+ * balls: [number] 
+ * } 
+ * }
+ */
 const rooms = {
-    "10": { players: new Map(), drawnNumbers: [], usedCartelas: new Set(), interval: null },
-    "20": { players: new Map(), drawnNumbers: [], usedCartelas: new Set(), interval: null },
-    "50": { players: new Map(), drawnNumbers: [], usedCartelas: new Set(), interval: null },
-    "100": { players: new Map(), drawnNumbers: [], usedCartelas: new Set(), interval: null }
+    10: { players: {}, takenBoxes: [], drawing: false, balls: [] },
+    20: { players: {}, takenBoxes: [], drawing: false, balls: [] },
+    50: { players: {}, takenBoxes: [], drawing: false, balls: [] },
+    100: { players: {}, takenBoxes: [], drawing: false, balls: [] }
 };
 
 io.on('connection', (socket) => {
     console.log('User connected:', socket.id);
 
-    // 1. Check if a Cartela (Card) is taken in a specific room
-    socket.on('checkCartela', ({ room, cartelaId }, callback) => {
-        const roomData = rooms[room.toString()];
-        if (!roomData) return callback({ available: true });
-        
-        const isTaken = roomData.usedCartelas.has(cartelaId);
-        callback({ available: !isTaken });
-    });
-
-    // 2. Join a specific stake room
-    socket.on('joinRoom', ({ room, cartelaId, userName }) => {
-        const roomStr = room.toString();
-        const roomData = rooms[roomStr];
-
-        if (!roomData) return;
-
-        // Leave previous rooms if any
-        socket.rooms.forEach(r => { if(r !== socket.id) socket.leave(r); });
-
-        // Join the new socket.io room
-        socket.join(roomStr);
-        
-        // Register player and card
-        roomData.players.set(socket.id, { userName, cartelaId });
-        roomData.usedCartelas.add(cartelaId);
-
-        console.log(`${userName} joined ${roomStr} ETB room with card ${cartelaId}`);
-
-        // Start ball drawing loop if this is the first player
-        if (roomData.players.size >= 1 && !roomData.interval) {
-            startBallLoop(roomStr);
+    // 1. Initial request to see which boxes are taken in a specific arena
+    socket.on('getTakenBoxes', ({ room }, callback) => {
+        if (rooms[room]) {
+            callback(rooms[room].takenBoxes);
+        } else {
+            callback([]);
         }
     });
 
-    // 3. Handle Bingo Claims
-    socket.on('claimBingo', ({ room, grid, marked }) => {
-        const roomStr = room.toString();
-        const roomData = rooms[roomStr];
-        
-        if (!roomData) return;
-
-        // Simple validation logic (server-side)
-        const allCalled = marked.every(num => num === 'FREE' || roomData.drawnNumbers.includes(num));
-        
-        if (allCalled) {
-            const prize = parseInt(roomStr) * roomData.players.size;
-            io.to(roomStr).emit('gameOver', {
-                room: roomStr,
-                winnerId: socket.id,
-                winnerName: roomData.players.get(socket.id).userName,
-                prize: prize
-            });
-            resetRoom(roomStr);
+    // 2. Immediate validation when a player clicks a specific number (1-50)
+    socket.on('checkBoxAvailability', ({ room, box }, callback) => {
+        const arena = rooms[room];
+        if (arena && !arena.takenBoxes.includes(box)) {
+            // Box is available at this exact microsecond
+            callback({ available: true });
+        } else {
+            // Box was likely taken while the user was looking at it
+            callback({ available: false });
         }
     });
 
-    socket.on('disconnect', () => {
-        Object.keys(rooms).forEach(roomStr => {
-            const roomData = rooms[roomStr];
-            if (roomData.players.has(socket.id)) {
-                const p = roomData.players.get(socket.id);
-                roomData.usedCartelas.delete(p.cartelaId);
-                roomData.players.delete(socket.id);
-                
-                if (roomData.players.size === 0) stopBallLoop(roomStr);
-            }
+    // 3. Official entry into the match
+    socket.on('joinRoom', ({ room, box, userName }) => {
+        const arena = rooms[room];
+        if (!arena) return;
+
+        // Double check lock
+        if (!arena.takenBoxes.includes(box)) {
+            arena.takenBoxes.push(box);
+        }
+
+        socket.join(room);
+        arena.players[socket.id] = { 
+            id: socket.id, 
+            name: userName, 
+            box: box 
+        };
+
+        console.log(`[Room ${room}] ${userName} reserved box #${box}`);
+
+        // Broadcast the update so other players see the 🔒 icon immediately
+        io.emit('boxUpdate', { room, takenBoxes: arena.takenBoxes });
+
+        // Start drawing balls if this is the first player to trigger the game cycle
+        if (!arena.drawing) {
+            startBingoDraw(room);
+        }
+    });
+
+    // 4. Bingo Claim Validation
+    socket.on('claimBingo', (data) => {
+        const arena = rooms[data.room];
+        if (!arena || !arena.drawing) return;
+
+        const winner = arena.players[socket.id];
+        
+        // Broadcast the win to everyone in that specific stake room
+        io.to(data.room).emit('gameOver', {
+            room: data.room,
+            winnerId: socket.id,
+            winnerName: winner ? winner.name : "Elite Player",
+            prize: data.room * 0.9 // 10% House Edge
         });
+
+        console.log(`[Room ${data.room}] Bingo claimed by ${winner ? winner.name : socket.id}`);
+
+        // Reset Room State for the next round
+        arena.drawing = false;
+        arena.balls = [];
+        arena.takenBoxes = [];
+        arena.players = {};
+        
+        // Clear locks for everyone looking at the discovery grid
+        io.emit('boxUpdate', { room: data.room, takenBoxes: [] });
+    });
+
+    // 5. Cleanup on Disconnect
+    socket.on('disconnect', () => {
+        for (const stake in rooms) {
+            const arena = rooms[stake];
+            if (arena.players[socket.id]) {
+                const releasedBox = arena.players[socket.id].box;
+                
+                // Remove the box from the taken list
+                arena.takenBoxes = arena.takenBoxes.filter(b => b !== releasedBox);
+                delete arena.players[socket.id];
+                
+                console.log(`[Room ${stake}] Box #${releasedBox} released by disconnect`);
+                
+                // Notify others that the box is now available
+                io.emit('boxUpdate', { room: stake, takenBoxes: arena.takenBoxes });
+                break;
+            }
+        }
     });
 });
 
-function startBallLoop(roomStr) {
-    const roomData = rooms[roomStr];
-    console.log(`Starting game loop for Room ${roomStr}`);
+/**
+ * Server-Side Random Number Generator
+ * Ensures all players in the same room see the same ball at the same time
+ */
+function startBingoDraw(room) {
+    const arena = rooms[room];
+    arena.drawing = true;
     
-    roomData.interval = setInterval(() => {
-        if (roomData.drawnNumbers.length >= 75) {
-            stopBallLoop(roomStr);
+    console.log(`[Room ${room}] Starting ball draw sequence...`);
+
+    const interval = setInterval(() => {
+        // Stop if the game ended (Bingo claimed) or room reset
+        if (!arena.drawing) {
+            clearInterval(interval);
             return;
         }
 
-        let nextNum;
+        // Stop if all balls drawn
+        if (arena.balls.length >= 75) {
+            arena.drawing = false;
+            clearInterval(interval);
+            return;
+        }
+
+        let newBall;
         do {
-            nextNum = Math.floor(Math.random() * 75) + 1;
-        } while (roomData.drawnNumbers.includes(nextNum));
+            newBall = Math.floor(Math.random() * 75) + 1;
+        } while (arena.balls.includes(newBall));
 
-        roomData.drawnNumbers.push(nextNum);
+        arena.balls.push(newBall);
         
-        io.to(roomStr).emit('ballDrawn', {
-            room: roomStr,
-            num: nextNum
-        });
-    }, 5000);
-}
+        // Send the ball to everyone currently in the game room
+        io.to(room).emit('ballDrawn', { room, num: newBall });
 
-function stopBallLoop(roomStr) {
-    if (rooms[roomStr].interval) {
-        clearInterval(rooms[roomStr].interval);
-        rooms[roomStr].interval = null;
-    }
-}
-
-function resetRoom(roomStr) {
-    stopBallLoop(roomStr);
-    rooms[roomStr].drawnNumbers = [];
-    rooms[roomStr].usedCartelas.clear();
+    }, 4500); // 4.5 seconds between balls for mobile readability
 }
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+server.listen(PORT, () => {
+    console.log(`Bingo Server Live on Port ${PORT}`);
+});
