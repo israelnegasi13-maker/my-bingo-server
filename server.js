@@ -5,152 +5,123 @@ const cors = require('cors');
 
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
 const io = new Server(server, {
-    cors: { origin: "*" }
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
 });
 
-// --- STATE MANAGEMENT ---
-const players = new Map(); // Store player data: id -> { name, balance, banned, socketId }
+// --- GAME STATE ---
+const ADMIN_SECRET = "ELITE_PRO_ADMIN";
+const players = {}; // stores player data by socket.id
 const rooms = {
-    "10": { players: [], balls: [], interval: null },
-    "20": { players: [], balls: [], interval: null },
-    "50": { players: [], balls: [], interval: null },
-    "100": { players: [], balls: [], interval: null }
+    "10": { players: new Set(), balls: [], gameStarted: false },
+    "50": { players: new Set(), balls: [], gameStarted: false },
+    "100": { players: new Set(), balls: [], gameStarted: false }
 };
 
-const ADMIN_SECRET = "ELITE_PRO_ADMIN";
+// --- HELPER FUNCTIONS ---
+
+/**
+ * Sends a structured data packet to all authenticated admins.
+ * This matches the expected format in the admin_panel.html (Canvas).
+ */
+function sendAdminUpdate() {
+    const playerArray = Object.values(players).map(p => ({
+        id: p.id,
+        name: p.name || 'Anonymous',
+        balance: p.balance || 0,
+        banned: p.banned || false
+    }));
+
+    const activeLobbies = Object.keys(rooms).filter(key => rooms[key].players.size > 0).length;
+
+    const stats = {
+        playerCount: playerArray.length,
+        lobbyCount: activeLobbies,
+        players: playerArray
+    };
+
+    io.to('admin_room').emit('admin_update_data', stats);
+}
+
+// --- SOCKET LOGIC ---
 
 io.on('connection', (socket) => {
-    console.log('User connected:', socket.id);
+    console.log(`New connection: ${socket.id}`);
 
-    // --- PLAYER LOGIC ---
-    socket.on('player_init', (data) => {
-        // Initialize or update player
-        const userId = data.userId || socket.id;
-        if (!players.has(userId)) {
-            players.set(userId, {
-                id: userId,
-                socketId: socket.id,
-                name: data.name || "Guest",
-                balance: 100.00, // Default starting balance
-                banned: false,
-                isInfinite: false
-            });
-        } else {
-            const p = players.get(userId);
-            p.socketId = socket.id;
-            players.set(userId, p);
-        }
-        
-        const player = players.get(userId);
-        socket.emit('player_data', player);
+    // Standard player registration
+    socket.on('register_player', (data) => {
+        players[socket.id] = {
+            id: socket.id,
+            name: data.name || 'New Player',
+            balance: 100, // Default starting balance
+            banned: false
+        };
+        console.log(`Player Registered: ${players[socket.id].name}`);
+        sendAdminUpdate();
     });
 
-    socket.on('joinLobby', (d) => {
-        const player = Array.from(players.values()).find(p => p.socketId === socket.id);
-        if (!player) return;
-        if (player.banned) return socket.emit('error', { msg: "You are banned." });
-        
-        // Logical check for balance
-        const stake = parseInt(d.room);
-        if (player.balance < stake && !player.isInfinite) {
-            return socket.emit('error', { msg: "Insufficient funds." });
-        }
+    // --- ADMIN PROTOCOLS ---
 
-        socket.join(d.room);
-        console.log(`${player.name} joined room ${d.room}`);
-        
-        // Start game loop if first person or logic requires
-        startBallDraw(d.room);
-    });
-
-    // --- ADMIN LOGIC ---
+    // Admin Handshake
     socket.on('admin_login', (data) => {
         if (data.secret === ADMIN_SECRET) {
             socket.isAdmin = true;
-            console.log("Admin authenticated");
-            sendAdminData();
+            socket.join('admin_room');
+            console.log(`Admin Authenticated: ${socket.id}`);
+            sendAdminUpdate();
+        } else {
+            socket.emit('admin_error', 'Invalid Secret Key');
         }
     });
 
+    // Manual data request from admin
     socket.on('admin_request_stats', () => {
-        if (socket.isAdmin) sendAdminData();
+        if (socket.isAdmin) sendAdminUpdate();
     });
 
+    // Update player balance from admin
     socket.on('admin_update_balance', (data) => {
-        if (!socket.isAdmin) return;
-        const player = players.get(data.targetId);
-        if (player) {
-            player.balance += data.amount;
-            players.set(data.targetId, player);
-            // Notify the specific player of their new balance
-            io.to(player.socketId).emit('balance_updated', { balance: player.balance });
-            sendAdminData();
-        }
-    });
-
-    socket.on('admin_ban_player', (data) => {
-        if (!socket.isAdmin) return;
-        const player = players.get(data.targetId);
-        if (player) {
-            player.banned = !player.banned;
-            players.set(data.targetId, player);
-            if (player.banned) {
-                io.to(player.socketId).emit('kicked', { reason: "Banned by Admin" });
+        if (socket.isAdmin) {
+            const { targetId, amount } = data;
+            if (players[targetId]) {
+                players[targetId].balance += amount;
+                // Notify the player of their new balance
+                io.to(targetId).emit('update_balance', players[targetId].balance);
+                sendAdminUpdate();
             }
-            sendAdminData();
         }
     });
 
-    socket.on('admin_toggle_infinite', (data) => {
-        if (!socket.isAdmin) return;
-        // Logic: Grant admin (yourself) infinite money
-        // We find the player record associated with this admin session if applicable
-        // Or apply to a specific hardcoded Admin ID
-        const adminPlayer = Array.from(players.values()).find(p => p.name.includes("Admin"));
-        if (adminPlayer) {
-            adminPlayer.isInfinite = data.active;
-            adminPlayer.balance = data.active ? 99999999 : 100;
-            io.to(adminPlayer.socketId).emit('player_data', adminPlayer);
+    // Ban/Unban player from admin
+    socket.on('admin_ban_player', (data) => {
+        if (socket.isAdmin) {
+            const { targetId } = data;
+            if (players[targetId]) {
+                players[targetId].banned = !players[targetId].banned;
+                if (players[targetId].banned) {
+                    io.to(targetId).emit('banned_notification', 'Your account has been restricted by an admin.');
+                }
+                sendAdminUpdate();
+            }
         }
-        sendAdminData();
     });
 
-    function sendAdminData() {
-        const adminData = {
-            playerCount: players.size,
-            lobbyCount: Object.keys(rooms).filter(r => io.sockets.adapter.rooms.get(r)).length,
-            players: Array.from(players.values())
-        };
-        io.emit('admin_update_data', adminData);
-    }
-
+    // --- CLEANUP ---
     socket.on('disconnect', () => {
-        console.log('User disconnected:', socket.id);
+        if (players[socket.id]) {
+            console.log(`Player Disconnected: ${players[socket.id].name}`);
+            delete players[socket.id];
+        }
+        sendAdminUpdate();
     });
 });
 
-function startBallDraw(room) {
-    if (rooms[room].interval) return; // Already running
-
-    rooms[room].interval = setInterval(() => {
-        if (rooms[room].balls.length >= 75) {
-            clearInterval(rooms[room].interval);
-            rooms[room].interval = null;
-            return;
-        }
-
-        let ball;
-        do { ball = Math.floor(Math.random() * 75) + 1; } 
-        while (rooms[room].balls.includes(ball));
-
-        rooms[room].balls.push(ball);
-        io.to(room).emit('ballDrawn', { room: room, num: ball });
-    }, 5000); // Draw every 5 seconds
-}
-
-const PORT = 3000;
+const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`Bingo Server running on port ${PORT}`);
 });
