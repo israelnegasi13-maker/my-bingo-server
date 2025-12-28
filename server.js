@@ -243,7 +243,7 @@ function endGame(roomAmount, winnerSocketId, winnerName) {
 io.on('connection', (socket) => {
   console.log('New connection:', socket.id);
   
-  // Initialize player
+  // Initialize player WITH 0 BALANCE
   socket.on('init', (data) => {
     const userId = data.userId;
     
@@ -254,14 +254,14 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Initialize or update player
+    // Initialize or update player WITH 0 BALANCE
     let player = gameState.players.get(socket.id);
     if (!player) {
       player = {
         socketId: socket.id,
         userId: userId,
         userName: data.userName || 'Guest',
-        balance: 100.00, // Default starting balance
+        balance: 0.00, // CHANGED FROM 100.00 TO 0.00
         currentRoom: null,
         box: null,
         grid: null,
@@ -272,6 +272,15 @@ io.on('connection', (socket) => {
     }
     
     socket.emit('balanceUpdate', player.balance);
+    console.log(`Player ${player.userName} (${socket.id}) connected with balance: ${player.balance}`);
+  });
+  
+  // Refresh balance request
+  socket.on('refreshBalance', () => {
+    const player = gameState.players.get(socket.id);
+    if (player) {
+      socket.emit('balanceRefreshed', player.balance);
+    }
   });
   
   // Get taken boxes for a room (FIXED: Now properly returns array of taken boxes)
@@ -292,12 +301,12 @@ io.on('connection', (socket) => {
     let player = gameState.players.get(socket.id);
     
     if (!player) {
-      // Create player if doesn't exist
+      // Create player if doesn't exist WITH 0 BALANCE
       player = {
         socketId: socket.id,
         userId: socket.id,
         userName: userName,
-        balance: 100.00,
+        balance: 0.00, // CHANGED FROM 100.00 TO 0.00
         currentRoom: null,
         box: null,
         grid: null,
@@ -454,6 +463,14 @@ io.on('connection', (socket) => {
     
     if (player) {
       player.balance += parseFloat(amount);
+      
+      // Notify player of funds added
+      io.to(player.socketId).emit('fundsAdded', {
+        amount: amount,
+        newBalance: player.balance
+      });
+      
+      // Also send balance update
       io.to(player.socketId).emit('balanceUpdate', player.balance);
       
       // Record transaction
@@ -466,7 +483,7 @@ io.on('connection', (socket) => {
         timestamp: new Date()
       });
       
-      socket.emit('admin:success', `Added ${amount} ETB to ${player.userName}`);
+      socket.emit('admin:success', `Added ${amount} ETB to ${player.userName} (New balance: ${player.balance})`);
       updateAdminDashboard();
     } else {
       socket.emit('admin:error', 'Player not found');
@@ -553,6 +570,27 @@ io.on('connection', (socket) => {
     socket.emit('admin:success', `Adjusted house balance by ${amount} ETB`);
     updateAdminDashboard();
   });
+  
+  socket.on('admin:setPlayerBalance', (data) => {
+    if (!socket.admin) return;
+    
+    const { playerId, balance } = data;
+    let player = null;
+    
+    for (let [socketId, p] of gameState.players) {
+      if (socketId === playerId || p.userId === playerId) {
+        player = p;
+        break;
+      }
+    }
+    
+    if (player) {
+      player.balance = parseFloat(balance);
+      io.to(player.socketId).emit('balanceUpdate', player.balance);
+      socket.emit('admin:success', `Set ${player.userName} balance to ${balance} ETB`);
+      updateAdminDashboard();
+    }
+  });
 });
 
 function updateAdminDashboard() {
@@ -603,6 +641,7 @@ app.get('/', (req, res) => {
         .container { max-width: 600px; margin: 0 auto; }
         .status { background: #f0f0f0; padding: 20px; border-radius: 10px; margin: 20px 0; }
         .online { color: green; font-weight: bold; }
+        .zero-balance { color: red; }
       </style>
     </head>
     <body>
@@ -612,6 +651,7 @@ app.get('/', (req, res) => {
           <p>Status: <span class="online">RUNNING</span></p>
           <p>Players Online: ${gameState.players.size}</p>
           <p>House Balance: ${gameState.houseBalance.toFixed(2)} ETB</p>
+          <p>Players with 0 balance: ${Array.from(gameState.players.values()).filter(p => p.balance === 0).length}</p>
         </div>
         <div>
           <h3>Available Endpoints:</h3>
@@ -620,6 +660,10 @@ app.get('/', (req, res) => {
             <li><strong>Admin Panel:</strong> <a href="/admin" target="_blank">/admin</a></li>
             <li><strong>Health Check:</strong> <a href="/health">/health</a></li>
           </ul>
+        </div>
+        <div style="margin-top: 20px; padding: 15px; background: #ffebee; border-radius: 5px;">
+          <strong>⚠️ IMPORTANT:</strong> New players start with <span class="zero-balance">0 ETB balance</span><br>
+          Admin must add funds for players to play
         </div>
       </div>
     </body>
@@ -631,6 +675,7 @@ app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
     players: gameState.players.size,
+    playersWithZeroBalance: Array.from(gameState.players.values()).filter(p => p.balance === 0).length,
     uptime: process.uptime(),
     timestamp: new Date()
   });
@@ -645,5 +690,6 @@ server.listen(PORT, () => {
   console.log(`✅ Server running on port ${PORT}`);
   console.log(`🎮 Game URL: http://localhost:${PORT}`);
   console.log(`🔧 Admin Panel: http://localhost:${PORT}/admin`);
-  console.log(`📊 Admin Password: admin123`);
+  console.log(`🔐 Admin Password: admin123`);
+  console.log(`💰 NEW PLAYERS START WITH: 0 ETB (Admin must add funds)`);
 });
