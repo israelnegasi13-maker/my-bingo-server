@@ -1,157 +1,649 @@
 const express = require('express');
 const http = require('http');
-const { Server } = require('socket.io');
+const socketIo = require('socket.io');
 const cors = require('cors');
 
 const app = express();
-app.use(cors());
-
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: {
-        origin: "*", // In production, replace with your client URL
-        methods: ["GET", "POST"]
-    }
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
-// Game State
+app.use(cors());
+app.use(express.json());
+
+// ========== GAME STATE ==========
 let gameState = {
-    isGameActive: false,
-    ballsDrawn: [],
-    players: new Map(), // userId -> { socketId, username, balance, stake, card, marked }
-    currentBallInterval: null,
-    drawSpeed: 5000, // 5 seconds per ball
-    maxBalls: 75
+  players: new Map(), // socket.id -> player data
+  rooms: new Map(), // room amount -> room data
+  takenBoxes: new Map(), // room amount -> Set of taken boxes (1-50)
+  activeGames: new Map(), // room amount -> game data
+  bannedPlayers: new Set(), // banned user IDs
+  transactions: [], // transaction history
+  houseBalance: 1000000, // Unlimited house money
 };
 
-io.on('connection', (socket) => {
-    console.log(`User connected: ${socket.id}`);
-
-    // Handle User Joining from Client
-    socket.on('join', (data) => {
-        const userId = data.user?.id || socket.id;
-        const username = data.user?.first_name || "Guest";
-
-        gameState.players.set(userId, {
-            socketId: socket.id,
-            username: username,
-            balance: 1000.0, // Should be fetched from DB in production
-            stake: 0,
-            card: [],
-            marked: []
-        });
-
-        // Send current game status to the newcomer
-        socket.emit('roomUpdate', {
-            isGameActive: gameState.isGameActive,
-            history: gameState.ballsDrawn
-        });
-
-        console.log(`${username} joined the lobby.`);
-        updateAdminStats();
-    });
-
-    // Handle Stake Placement
-    socket.on('placeStake', (data) => {
-        const player = Array.from(gameState.players.values()).find(p => p.socketId === socket.id);
-        if (player) {
-            player.stake = data.amount;
-            player.card = data.card;
-            console.log(`${player.username} staked ${data.amount} and received a card.`);
-            updateAdminStats();
-        }
-    });
-
-    // Handle Admin: Start Game
-    socket.on('adminStartGame', () => {
-        if (gameState.isGameActive) return;
-
-        gameState.isGameActive = true;
-        gameState.ballsDrawn = [];
-        
-        io.emit('gameReset'); // Clear client screens
-        io.emit('log', { message: "Game Started!", type: "success" });
-
-        gameState.currentBallInterval = setInterval(() => {
-            if (gameState.ballsDrawn.length >= gameState.maxBalls) {
-                stopGame("Draw Limit Reached");
-                return;
-            }
-
-            let newBall;
-            do {
-                newBall = Math.floor(Math.random() * 75) + 1;
-            } while (gameState.ballsDrawn.includes(newBall));
-
-            gameState.ballsDrawn.push(newBall);
-            io.emit('ballDrawn', newBall);
-            updateAdminStats();
-
-        }, gameState.drawSpeed);
-    });
-
-    // Handle Admin: Stop/Reset Game
-    socket.on('adminStopGame', () => {
-        stopGame("Admin terminated the session");
-    });
-
-    // Handle Bingo Claim
-    socket.on('claimBingo', (data) => {
-        const player = Array.from(gameState.players.values()).find(p => p.socketId === socket.id);
-        if (!player) return;
-
-        // SERVER-SIDE VALIDATION
-        // 1. Verify all marked numbers were actually drawn
-        const isValidMarking = data.marked.every(num => 
-            num === "FREE" || gameState.ballsDrawn.includes(num)
-        );
-
-        // 2. Verify all marked numbers are on the player's card
-        const isOwnCard = data.marked.every(num => 
-            num === "FREE" || player.card.includes(num)
-        );
-
-        if (isValidMarking && isOwnCard) {
-            io.emit('gameWinner', { 
-                username: player.username, 
-                prize: player.stake * 10 // Example multiplier
-            });
-            stopGame(`Winner: ${player.username}`);
-        } else {
-            socket.emit('log', { message: "Invalid Bingo Claim!", type: "error" });
-        }
-    });
-
-    socket.on('disconnect', () => {
-        // Find and remove player
-        for (let [userId, player] of gameState.players) {
-            if (player.socketId === socket.id) {
-                gameState.players.delete(userId);
-                break;
-            }
-        }
-        updateAdminStats();
-    });
+// Initialize rooms with box tracking
+[10, 20, 50, 100].forEach(amount => {
+  gameState.rooms.set(amount, {
+    amount: amount,
+    players: new Set(),
+    status: 'waiting',
+    countdown: null,
+    calledNumbers: new Set(),
+    winner: null,
+    gameInterval: null,
+    takenBoxes: new Set(),
+  });
 });
 
-function stopGame(reason) {
-    clearInterval(gameState.currentBallInterval);
-    gameState.isGameActive = false;
-    io.emit('gameEnded', { reason });
-    io.emit('log', { message: `Game Over: ${reason}`, type: "info" });
+// ========== HELPER FUNCTIONS ==========
+function generateGrid(seed) {
+  let nums = Array.from({length: 75}, (_, i) => i + 1);
+  
+  function seededRandom(s) {
+    var mask = 0xffffffff;
+    var m_w = (123456789 + s) & mask;
+    var m_z = (987654321 - s) & mask;
+
+    return function() {
+      m_z = (36969 * (m_z & 65535) + (m_z >> 16)) & mask;
+      m_w = (18000 * (m_w & 65535) + (m_w >> 16)) & mask;
+      var result = ((m_z << 16) + (m_w & 65535)) >>> 0;
+      return result / 4294967296;
+    }
+  }
+
+  const random = seededRandom(seed * 777);
+  
+  for (let i = nums.length - 1; i > 0; i--) {
+    const j = Math.floor(random() * (i + 1));
+    [nums[i], nums[j]] = [nums[j], nums[i]];
+  }
+
+  const grid = [];
+  for(let i=0; i<25; i++) {
+    grid.push(i === 12 ? 'FREE' : nums[i]);
+  }
+  return grid;
 }
 
-function updateAdminStats() {
-    const stats = {
-        onlinePlayers: gameState.players.size,
-        activeStakes: Array.from(gameState.players.values()).filter(p => p.stake > 0).length,
-        totalPool: Array.from(gameState.players.values()).reduce((sum, p) => sum + p.stake, 0),
-        ballsDrawnCount: gameState.ballsDrawn.length
-    };
-    io.emit('adminStatsUpdate', stats);
+function checkWinningPattern(grid, marked) {
+  const markedSet = new Set(marked);
+  const isM = (idx) => markedSet.has(grid[idx]);
+  
+  for(let i=0; i<5; i++) {
+    // Horizontal
+    if(isM(i*5) && isM(i*5+1) && isM(i*5+2) && isM(i*5+3) && isM(i*5+4)) return true;
+    // Vertical
+    if(isM(i) && isM(i+5) && isM(i+10) && isM(i+15) && isM(i+20)) return true;
+  }
+  // Diagonals
+  if(isM(0) && isM(6) && isM(12) && isM(18) && isM(24)) return true;
+  if(isM(4) && isM(8) && isM(12) && isM(16) && isM(20)) return true;
+  
+  return false;
 }
+
+function startGame(roomAmount) {
+  const room = gameState.rooms.get(roomAmount);
+  if (!room || room.players.size < 2) return;
+  
+  room.status = 'playing';
+  room.calledNumbers = new Set();
+  room.winner = null;
+  
+  // Assign grids to players based on their selected box
+  room.players.forEach(socketId => {
+    const player = gameState.players.get(socketId);
+    if (player) {
+      player.grid = generateGrid(player.box);
+      player.marked = new Set(['FREE']);
+    }
+  });
+  
+  // Start countdown
+  let countdown = 5;
+  const countdownInterval = setInterval(() => {
+    room.players.forEach(socketId => {
+      io.to(socketId).emit('gameCountdown', { room: roomAmount, timer: countdown });
+    });
+    
+    if (countdown <= 0) {
+      clearInterval(countdownInterval);
+      room.players.forEach(socketId => {
+        io.to(socketId).emit('gameCountdown', { room: roomAmount, timer: 0 });
+      });
+      startDrawingBalls(roomAmount);
+    }
+    countdown--;
+  }, 1000);
+}
+
+function startDrawingBalls(roomAmount) {
+  const room = gameState.rooms.get(roomAmount);
+  if (!room) return;
+  
+  const numbers = Array.from({length: 75}, (_, i) => i + 1);
+  const drawnNumbers = new Set();
+  
+  room.gameInterval = setInterval(() => {
+    if (drawnNumbers.size >= 75 || room.winner) {
+      clearInterval(room.gameInterval);
+      if (!room.winner) {
+        // House wins - no bingo claimed
+        endGame(roomAmount, 'HOUSE', null);
+      }
+      return;
+    }
+    
+    let num;
+    do {
+      num = Math.floor(Math.random() * 75) + 1;
+    } while (drawnNumbers.has(num));
+    
+    drawnNumbers.add(num);
+    room.calledNumbers.add(num);
+    
+    // Send ball to all players in room
+    room.players.forEach(socketId => {
+      io.to(socketId).emit('ballDrawn', { room: roomAmount, num: num });
+    });
+    
+    // Check if any player can claim bingo
+    room.players.forEach(socketId => {
+      const player = gameState.players.get(socketId);
+      if (player && player.grid) {
+        // Get player's marked numbers
+        const markedNumbers = Array.from(player.marked);
+        // Check if they have a winning pattern
+        if (checkWinningPattern(player.grid, markedNumbers)) {
+          io.to(socketId).emit('enableBingo');
+        }
+      }
+    });
+    
+  }, 3000); // Draw every 3 seconds
+}
+
+function endGame(roomAmount, winnerSocketId, winnerName) {
+  const room = gameState.rooms.get(roomAmount);
+  if (!room) return;
+  
+  const prize = room.amount * room.players.size;
+  
+  if (winnerSocketId === 'HOUSE') {
+    // House wins all
+    gameState.houseBalance += prize;
+    room.players.forEach(socketId => {
+      io.to(socketId).emit('gameOver', {
+        room: roomAmount,
+        winnerId: 'HOUSE',
+        winnerName: 'HOUSE',
+        prize: 0
+      });
+    });
+  } else {
+    // Player wins
+    const winner = gameState.players.get(winnerSocketId);
+    if (winner) {
+      winner.balance += prize;
+      gameState.houseBalance -= prize;
+      
+      io.to(winnerSocketId).emit('gameOver', {
+        room: roomAmount,
+        winnerId: winnerSocketId,
+        winnerName: winner.userName,
+        prize: prize
+      });
+      
+      // Notify losers
+      room.players.forEach(socketId => {
+        if (socketId !== winnerSocketId) {
+          io.to(socketId).emit('gameOver', {
+            room: roomAmount,
+            winnerId: winnerSocketId,
+            winnerName: winner.userName,
+            prize: 0
+          });
+        }
+      });
+    }
+  }
+  
+  // Clear room for next game
+  if (room.gameInterval) {
+    clearInterval(room.gameInterval);
+  }
+  
+  // Clear taken boxes for this room
+  room.takenBoxes.clear();
+  room.players.clear();
+  room.status = 'waiting';
+  room.winner = null;
+  room.calledNumbers.clear();
+  
+  // Record transaction
+  gameState.transactions.push({
+    type: winnerSocketId === 'HOUSE' ? 'house_win' : 'player_win',
+    amount: prize,
+    winner: winnerSocketId,
+    winnerName: winnerName,
+    room: roomAmount,
+    timestamp: new Date()
+  });
+  
+  updateAdminDashboard();
+}
+
+// ========== SOCKET.IO HANDLERS ==========
+io.on('connection', (socket) => {
+  console.log('New connection:', socket.id);
+  
+  // Initialize player
+  socket.on('init', (data) => {
+    const userId = data.userId;
+    
+    // Check if banned
+    if (gameState.bannedPlayers.has(userId)) {
+      socket.emit('banned');
+      socket.disconnect();
+      return;
+    }
+    
+    // Initialize or update player
+    let player = gameState.players.get(socket.id);
+    if (!player) {
+      player = {
+        socketId: socket.id,
+        userId: userId,
+        userName: data.userName || 'Guest',
+        balance: 100.00, // Default starting balance
+        currentRoom: null,
+        box: null,
+        grid: null,
+        marked: new Set(),
+        joinedAt: new Date()
+      };
+      gameState.players.set(socket.id, player);
+    }
+    
+    socket.emit('balanceUpdate', player.balance);
+  });
+  
+  // Get taken boxes for a room (FIXED: Now properly returns array of taken boxes)
+  socket.on('getTakenBoxes', (data, callback) => {
+    const room = gameState.rooms.get(data.room);
+    if (room && callback) {
+      // Return array of taken boxes (1-50)
+      callback(Array.from(room.takenBoxes));
+    } else {
+      callback([]);
+    }
+  });
+  
+  // Join room
+  socket.on('joinRoom', (data) => {
+    const { room: amount, box, userName } = data;
+    const room = gameState.rooms.get(amount);
+    let player = gameState.players.get(socket.id);
+    
+    if (!player) {
+      // Create player if doesn't exist
+      player = {
+        socketId: socket.id,
+        userId: socket.id,
+        userName: userName,
+        balance: 100.00,
+        currentRoom: null,
+        box: null,
+        grid: null,
+        marked: new Set(),
+        joinedAt: new Date()
+      };
+      gameState.players.set(socket.id, player);
+    }
+    
+    if (!room) {
+      socket.emit('error', 'Room not found');
+      return;
+    }
+    
+    // Check if player has enough balance
+    if (player.balance < amount) {
+      socket.emit('insufficientFunds');
+      return;
+    }
+    
+    // Check if box (1-50) is already taken in this room
+    if (room.takenBoxes.has(box)) {
+      socket.emit('boxTaken');
+      return;
+    }
+    
+    // Deduct stake from player
+    player.balance -= amount;
+    gameState.houseBalance += amount;
+    
+    // Update player state
+    player.currentRoom = amount;
+    player.box = box;
+    player.userName = userName;
+    
+    // Add player to room
+    room.players.add(socket.id);
+    room.takenBoxes.add(box);
+    
+    // Send updated balance
+    socket.emit('balanceUpdate', player.balance);
+    socket.emit('joinedRoom');
+    
+    // Update lobby for all players in room
+    const playerCount = room.players.size;
+    room.players.forEach(playerSocketId => {
+      io.to(playerSocketId).emit('lobbyUpdate', {
+        room: amount,
+        count: playerCount
+      });
+    });
+    
+    // Record transaction
+    gameState.transactions.push({
+      type: 'stake',
+      playerId: socket.id,
+      playerName: userName,
+      amount: amount,
+      room: amount,
+      timestamp: new Date()
+    });
+    
+    // Start game if we have 2+ players and game isn't already running
+    if (playerCount >= 2 && room.status === 'waiting') {
+      setTimeout(() => startGame(amount), 2000);
+    }
+    
+    updateAdminDashboard();
+  });
+  
+  // Claim bingo
+  socket.on('claimBingo', (data) => {
+    const { room: amount, grid, marked } = data;
+    const room = gameState.rooms.get(amount);
+    const player = gameState.players.get(socket.id);
+    
+    if (!room || !player || room.status !== 'playing') {
+      return;
+    }
+    
+    // Verify winning pattern
+    if (checkWinningPattern(grid, marked)) {
+      room.winner = socket.id;
+      endGame(amount, socket.id, player.userName);
+    }
+  });
+  
+  // Disconnection
+  socket.on('disconnect', () => {
+    const player = gameState.players.get(socket.id);
+    if (player && player.currentRoom) {
+      const room = gameState.rooms.get(player.currentRoom);
+      if (room) {
+        room.players.delete(socket.id);
+        if (player.box) {
+          room.takenBoxes.delete(player.box);
+        }
+        
+        // Update remaining players
+        const playerCount = room.players.size;
+        if (playerCount > 0) {
+          room.players.forEach(playerSocketId => {
+            io.to(playerSocketId).emit('lobbyUpdate', {
+              room: player.currentRoom,
+              count: playerCount
+            });
+          });
+        } else {
+          // No players left, reset room
+          if (room.gameInterval) {
+            clearInterval(room.gameInterval);
+          }
+          room.status = 'waiting';
+          room.takenBoxes.clear();
+        }
+      }
+    }
+    
+    gameState.players.delete(socket.id);
+    updateAdminDashboard();
+  });
+  
+  // ========== ADMIN EVENTS ==========
+  socket.on('admin:auth', (password) => {
+    // Simple password check - change this in production!
+    if (password === 'admin123') {
+      socket.admin = true;
+      socket.join('admins');
+      socket.emit('admin:authSuccess');
+      updateAdminDashboard();
+    } else {
+      socket.emit('admin:authError', 'Invalid password');
+    }
+  });
+  
+  socket.on('admin:getData', () => {
+    if (!socket.admin) return;
+    updateAdminDashboard();
+  });
+  
+  socket.on('admin:addFunds', (data) => {
+    if (!socket.admin) return;
+    
+    const { playerId, amount } = data;
+    let player = null;
+    
+    // Find player by socket ID or user ID
+    for (let [socketId, p] of gameState.players) {
+      if (socketId === playerId || p.userId === playerId) {
+        player = p;
+        break;
+      }
+    }
+    
+    if (player) {
+      player.balance += parseFloat(amount);
+      io.to(player.socketId).emit('balanceUpdate', player.balance);
+      
+      // Record transaction
+      gameState.transactions.push({
+        type: 'admin_add',
+        admin: socket.id,
+        playerId: player.socketId,
+        playerName: player.userName,
+        amount: amount,
+        timestamp: new Date()
+      });
+      
+      socket.emit('admin:success', `Added ${amount} ETB to ${player.userName}`);
+      updateAdminDashboard();
+    } else {
+      socket.emit('admin:error', 'Player not found');
+    }
+  });
+  
+  socket.on('admin:banPlayer', (playerId) => {
+    if (!socket.admin) return;
+    
+    let player = null;
+    for (let [socketId, p] of gameState.players) {
+      if (socketId === playerId || p.userId === playerId) {
+        player = p;
+        break;
+      }
+    }
+    
+    if (player) {
+      gameState.bannedPlayers.add(player.userId);
+      io.to(player.socketId).emit('banned');
+      setTimeout(() => {
+        const sock = io.sockets.sockets.get(player.socketId);
+        if (sock) sock.disconnect();
+      }, 1000);
+      
+      socket.emit('admin:success', `Banned ${player.userName}`);
+      updateAdminDashboard();
+    }
+  });
+  
+  socket.on('admin:forceDraw', (roomAmount) => {
+    if (!socket.admin) return;
+    
+    const room = gameState.rooms.get(parseInt(roomAmount));
+    if (room && room.status === 'playing') {
+      // Force draw a random number
+      let num;
+      do {
+        num = Math.floor(Math.random() * 75) + 1;
+      } while (room.calledNumbers.has(num));
+      
+      room.calledNumbers.add(num);
+      room.players.forEach(socketId => {
+        io.to(socketId).emit('ballDrawn', { room: roomAmount, num: num });
+      });
+    }
+  });
+  
+  socket.on('admin:forceStart', (roomAmount) => {
+    if (!socket.admin) return;
+    
+    const room = gameState.rooms.get(parseInt(roomAmount));
+    if (room && room.players.size >= 1) {
+      startGame(parseInt(roomAmount));
+    }
+  });
+  
+  socket.on('admin:forceEnd', (roomAmount) => {
+    if (!socket.admin) return;
+    
+    const room = gameState.rooms.get(parseInt(roomAmount));
+    if (room) {
+      endGame(parseInt(roomAmount), 'HOUSE', null);
+    }
+  });
+  
+  socket.on('admin:kickPlayer', (playerId) => {
+    if (!socket.admin) return;
+    
+    const player = gameState.players.get(playerId);
+    if (player) {
+      const sock = io.sockets.sockets.get(playerId);
+      if (sock) {
+        sock.disconnect();
+        socket.emit('admin:success', `Kicked ${player.userName}`);
+      }
+    }
+  });
+  
+  socket.on('admin:adjustHouse', (amount) => {
+    if (!socket.admin) return;
+    
+    gameState.houseBalance += parseFloat(amount);
+    socket.emit('admin:success', `Adjusted house balance by ${amount} ETB`);
+    updateAdminDashboard();
+  });
+});
+
+function updateAdminDashboard() {
+  const activePlayers = Array.from(gameState.players.values());
+  const roomsData = {};
+  
+  gameState.rooms.forEach((room, amount) => {
+    roomsData[amount] = {
+      amount: amount,
+      players: Array.from(room.players),
+      playerCount: room.players.size,
+      status: room.status,
+      takenBoxes: Array.from(room.takenBoxes),
+      calledNumbers: Array.from(room.calledNumbers)
+    };
+  });
+  
+  // Calculate total wagered
+  const totalWagered = gameState.transactions
+    .filter(t => t.type === 'stake')
+    .reduce((sum, t) => sum + t.amount, 0);
+  
+  // Calculate active games
+  const activeGames = Array.from(gameState.rooms.values())
+    .filter(r => r.status === 'playing').length;
+  
+  io.to('admins').emit('admin:update', {
+    totalPlayers: activePlayers.length,
+    activeGames: activeGames,
+    houseBalance: gameState.houseBalance,
+    totalWagered: totalWagered
+  });
+  
+  io.to('admins').emit('admin:players', activePlayers);
+  io.to('admins').emit('admin:rooms', roomsData);
+  io.to('admins').emit('admin:transactions', gameState.transactions.slice(-50));
+}
+
+// ========== HTTP ROUTES ==========
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Bingo Elite Server</title>
+      <style>
+        body { font-family: Arial, sans-serif; padding: 40px; text-align: center; }
+        .container { max-width: 600px; margin: 0 auto; }
+        .status { background: #f0f0f0; padding: 20px; border-radius: 10px; margin: 20px 0; }
+        .online { color: green; font-weight: bold; }
+      </style>
+    </head>
+    <body>
+      <div class="container">
+        <h1>🎮 Bingo Elite Server</h1>
+        <div class="status">
+          <p>Status: <span class="online">RUNNING</span></p>
+          <p>Players Online: ${gameState.players.size}</p>
+          <p>House Balance: ${gameState.houseBalance.toFixed(2)} ETB</p>
+        </div>
+        <div>
+          <h3>Available Endpoints:</h3>
+          <ul style="text-align: left;">
+            <li><strong>Game:</strong> Connect via WebSocket</li>
+            <li><strong>Admin Panel:</strong> <a href="/admin" target="_blank">/admin</a></li>
+            <li><strong>Health Check:</strong> <a href="/health">/health</a></li>
+          </ul>
+        </div>
+      </div>
+    </body>
+    </html>
+  `);
+});
+
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    players: gameState.players.size,
+    uptime: process.uptime(),
+    timestamp: new Date()
+  });
+});
+
+app.get('/admin', (req, res) => {
+  res.sendFile(__dirname + '/admin.html');
+});
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`Bingo Server running on port ${PORT}`);
+  console.log(`✅ Server running on port ${PORT}`);
+  console.log(`🎮 Game URL: http://localhost:${PORT}`);
+  console.log(`🔧 Admin Panel: http://localhost:${PORT}/admin`);
+  console.log(`📊 Admin Password: admin123`);
 });
