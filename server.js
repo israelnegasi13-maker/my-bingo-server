@@ -1,304 +1,237 @@
 const express = require('express');
 const http = require('http');
-const socketIo = require('socket.io');
+const { Server } = require('socket.io');
+const mongoose = require('mongoose');
 const cors = require('cors');
 const path = require('path');
 
-// Initialize app
-const app = express();
-const server = http.createServer(app);
+// --- CONFIGURATION ---
+const PORT = process.env.PORT || 3000;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/bingo_elite';
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
 
-// Basic middleware
+const app = express();
 app.use(cors());
 app.use(express.json());
-app.use(express.static('public'));
 
-// Simple root route
-app.get('/', (req, res) => {
-  res.send('Bingo Elite Server is running');
+const server = http.createServer(app);
+const io = new Server(server, {
+    cors: { origin: "*" }
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime()
-  });
+// --- DATABASE MODELS ---
+const userSchema = new mongoose.Schema({
+    telegramId: { type: String, unique: true, required: true },
+    userName: String,
+    balance: { type: Number, default: 0 },
+    isBanned: { type: Boolean, default: false },
+    lastLogin: { type: Date, default: Date.now }
 });
 
-// Serve game files
-app.get('/game', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'game.html'));
-});
+const User = mongoose.model('User', userSchema);
 
-app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'admin.html'));
-});
+// --- IN-MEMORY STATE ---
+// Store active game rooms and transient socket data
+const rooms = {}; // Format: { stakeAmount: { players: [socketId], gameStatus: 'waiting'|'playing' } }
+const playerState = {}; // Format: { socketId: { userId, userName, currentRoom, box, ... } }
 
-// Initialize Socket.io
-const io = socketIo(server, {
-  cors: {
-    origin: "*",
-    methods: ["GET", "POST"]
-  },
-  pingTimeout: 60000,
-  pingInterval: 25000
-});
-
-// Game state
-const rooms = {
-  10: { players: [], takenBoxes: [], status: 'waiting', calledNumbers: [] },
-  20: { players: [], takenBoxes: [], status: 'waiting', calledNumbers: [] },
-  50: { players: [], takenBoxes: [], status: 'waiting', calledNumbers: [] },
-  100: { players: [], takenBoxes: [], status: 'waiting', calledNumbers: [] }
+// --- HELPERS ---
+const updateBalance = async (telegramId, amount) => {
+    const user = await User.findOneAndUpdate(
+        { telegramId },
+        { $inc: { balance: amount } },
+        { new: true }
+    );
+    return user ? user.balance : 0;
 };
 
-const players = new Map();
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "admin123";
-
-// Socket.io connection
+// --- SOCKET LOGIC ---
 io.on('connection', (socket) => {
-  console.log('New client connected:', socket.id);
-  
-  // Initialize player
-  socket.on('init', (data) => {
-    const { userId, userName } = data;
-    
-    players.set(socket.id, {
-      socketId: socket.id,
-      userId: userId,
-      userName: userName || 'Guest',
-      balance: 1000.00, // Default balance for testing
-      currentRoom: null,
-      box: null
-    });
-    
-    socket.emit('balanceUpdate', 1000.00);
-    socket.emit('joinedRoom');
-  });
-  
-  // Get available boxes
-  socket.on('getTakenBoxes', (data, callback) => {
-    const { room } = data;
-    callback(rooms[room] ? rooms[room].takenBoxes : []);
-  });
-  
-  // Join room
-  socket.on('joinRoom', (data) => {
-    const { room, box, userName } = data;
-    const player = players.get(socket.id);
-    
-    if (!player) return;
-    
-    // Check if box is taken
-    if (rooms[room].takenBoxes.includes(box)) {
-      socket.emit('boxTaken');
-      return;
-    }
-    
-    // Check balance
-    if (player.balance < room) {
-      socket.emit('insufficientFunds');
-      return;
-    }
-    
-    // Deduct stake
-    player.balance -= room;
-    player.currentRoom = room;
-    player.box = box;
-    
-    // Add to room
-    rooms[room].players.push({
-      socketId: socket.id,
-      userId: player.userId,
-      userName: player.userName,
-      box: box
-    });
-    
-    rooms[room].takenBoxes.push(box);
-    
-    // Update lobby
-    const playerCount = rooms[room].players.length;
-    io.to(getRoomSockets(room)).emit('lobbyUpdate', {
-      room: room,
-      count: playerCount
-    });
-    
-    socket.emit('balanceUpdate', player.balance);
-    socket.emit('joinedRoom');
-    
-    // Start game if 2+ players
-    if (playerCount >= 2 && rooms[room].status === 'waiting') {
-      startGameCountdown(room);
-    }
-  });
-  
-  // Claim bingo
-  socket.on('claimBingo', (data) => {
-    const { room, grid, marked } = data;
-    const player = players.get(socket.id);
-    
-    if (!player || player.currentRoom !== room) return;
-    
-    const prize = room * 1.8; // 80% return
-    player.balance += prize;
-    
-    // Notify all players
-    io.to(getRoomSockets(room)).emit('gameOver', {
-      room: room,
-      winnerId: socket.id,
-      winnerName: player.userName,
-      prize: prize
-    });
-    
-    socket.emit('balanceUpdate', player.balance);
-    resetRoom(room);
-  });
-  
-  // Refresh balance
-  socket.on('refreshBalance', () => {
-    const player = players.get(socket.id);
-    if (player) {
-      socket.emit('balanceUpdate', player.balance);
-    }
-  });
-  
-  // Admin authentication
-  socket.on('admin:auth', (password) => {
-    if (password === ADMIN_PASSWORD) {
-      socket.emit('admin:authSuccess');
-    } else {
-      socket.emit('admin:authError', 'Invalid password');
-    }
-  });
-  
-  // Admin get data
-  socket.on('admin:getData', () => {
-    const totalPlayers = players.size;
-    const activeGames = Object.values(rooms).filter(r => r.status === 'playing').length;
-    
-    socket.emit('admin:update', {
-      totalPlayers,
-      activeGames,
-      houseBalance: 0,
-      totalWagered: 0
-    });
-    
-    socket.emit('admin:players', Array.from(players.values()));
-    socket.emit('admin:rooms', rooms);
-  });
-  
-  // Admin add funds
-  socket.on('admin:addFunds', (data) => {
-    const { playerId, amount } = data;
-    
-    // Find player by socket ID
-    const player = players.get(playerId);
-    if (player) {
-      player.balance += parseFloat(amount);
-      io.to(playerId).emit('balanceUpdate', player.balance);
-      socket.emit('admin:success', `Added ${amount} ETB to player`);
-    }
-  });
-  
-  // Disconnect
-  socket.on('disconnect', () => {
-    console.log('Client disconnected:', socket.id);
-    const player = players.get(socket.id);
-    
-    if (player && player.currentRoom) {
-      const room = rooms[player.currentRoom];
-      if (room) {
-        room.players = room.players.filter(p => p.socketId !== socket.id);
-        room.takenBoxes = room.takenBoxes.filter(b => b !== player.box);
-        
-        io.to(getRoomSockets(player.currentRoom)).emit('lobbyUpdate', {
-          room: player.currentRoom,
-          count: room.players.length
-        });
-        
-        if (room.players.length === 0) {
-          resetRoom(player.currentRoom);
+    console.log(`New connection: ${socket.id}`);
+
+    // Authentication / Registration
+    socket.on('auth', async (userData) => {
+        try {
+            let user = await User.findOne({ telegramId: userData.id.toString() });
+            
+            if (!user) {
+                user = await User.create({
+                    telegramId: userData.id.toString(),
+                    userName: userData.username || userData.first_name,
+                    balance: 100 // Starting bonus
+                });
+            }
+
+            if (user.isBanned) {
+                socket.emit('banned');
+                socket.disconnect();
+                return;
+            }
+
+            playerState[socket.id] = {
+                userId: user.telegramId,
+                userName: user.userName,
+                balance: user.balance,
+                socketId: socket.id,
+                currentRoom: null,
+                box: null
+            };
+
+            socket.emit('authSuccess', {
+                balance: user.balance,
+                userName: user.userName
+            });
+
+            // Send initial online count to player
+            io.emit('statsUpdate', { online: Object.keys(playerState).length });
+        } catch (err) {
+            console.error('Auth Error:', err);
         }
-      }
-    }
-    
-    players.delete(socket.id);
-  });
+    });
+
+    // Matchmaking: Join Room
+    socket.on('joinRoom', async (data) => {
+        const { stake } = data;
+        const player = playerState[socket.id];
+        
+        if (!player || player.balance < stake) {
+            return socket.emit('error', 'Insufficient balance');
+        }
+
+        // Initialize room if not exists
+        if (!rooms[stake]) {
+            rooms[stake] = { players: [], gameStatus: 'waiting' };
+        }
+
+        const room = rooms[stake];
+
+        if (room.gameStatus === 'playing') {
+            return socket.emit('error', 'Game already in progress. Please wait.');
+        }
+
+        // Join room
+        player.currentRoom = stake;
+        room.players.push(socket.id);
+        socket.join(`room_${stake}`);
+
+        io.to(`room_${stake}`).emit('playerJoined', {
+            count: room.players.length,
+            players: room.players.map(id => playerState[id].userName)
+        });
+
+        // Start game logic when 2 players join
+        if (room.players.length === 2) {
+            room.gameStatus = 'playing';
+            
+            // Deduct stakes
+            for (const pid of room.players) {
+                const p = playerState[pid];
+                const newBal = await updateBalance(p.userId, -stake);
+                p.balance = newBal;
+                io.to(pid).emit('balanceRefreshed', newBal);
+            }
+
+            io.to(`room_${stake}`).emit('gameStart', {
+                opponent: "Opponent Found",
+                prize: stake * 1.8 // House takes 10% from each player
+            });
+        }
+    });
+
+    // Box Selection
+    socket.on('selectBox', (boxNumber) => {
+        const player = playerState[socket.id];
+        if (!player || !player.currentRoom) return;
+
+        player.box = boxNumber;
+        const room = rooms[player.currentRoom];
+        
+        // Check if both players have selected
+        const selections = room.players.filter(pid => playerState[pid].box !== null);
+        
+        if (selections.length === 2) {
+            // Determine winner (Simplified Bingo Logic)
+            const winnerIdx = Math.floor(Math.random() * 2);
+            const winnerId = room.players[winnerIdx];
+            const loserId = room.players[1 - winnerIdx];
+            
+            const prize = player.currentRoom * 1.8;
+
+            // Update Winner
+            updateBalance(playerState[winnerId].userId, prize).then(newBal => {
+                playerState[winnerId].balance = newBal;
+                io.to(winnerId).emit('gameResult', { status: 'win', prize, newBalance: newBal });
+            });
+
+            // Notify Loser
+            io.to(loserId).emit('gameResult', { 
+                status: 'lose', 
+                msg: `Better luck next time! Box ${playerState[winnerId].box} was the winner.` 
+            });
+
+            // Cleanup Room
+            room.players.forEach(pid => {
+                const p = playerState[pid];
+                p.currentRoom = null;
+                p.box = null;
+            });
+            delete rooms[player.currentRoom];
+        }
+    });
+
+    // ADMIN ACTIONS
+    socket.on('adminLogin', (pass) => {
+        if (pass === ADMIN_PASSWORD) {
+            socket.emit('adminAuthSuccess');
+            // Send full player list to admin
+            socket.emit('playerListUpdate', Object.values(playerState));
+        } else {
+            socket.emit('error', 'Invalid Admin Password');
+        }
+    });
+
+    socket.on('addFunds', async (data) => {
+        const targetPlayer = playerState[data.socketId];
+        if (targetPlayer) {
+            const newBal = await updateBalance(targetPlayer.userId, data.amount);
+            targetPlayer.balance = newBal;
+            io.to(data.socketId).emit('fundsAdded', { amount: data.amount, newBalance: newBal });
+            // Refresh admin view
+            io.emit('playerListUpdate', Object.values(playerState));
+        }
+    });
+
+    socket.on('banPlayer', async (socketId) => {
+        const targetPlayer = playerState[socketId];
+        if (targetPlayer) {
+            await User.findOneAndUpdate({ telegramId: targetPlayer.userId }, { isBanned: true });
+            io.to(socketId).emit('banned');
+            delete playerState[socketId];
+            io.sockets.sockets.get(socketId)?.disconnect();
+            io.emit('playerListUpdate', Object.values(playerState));
+        }
+    });
+
+    // Disconnect handling
+    socket.on('disconnect', () => {
+        if (playerState[socket.id]) {
+            const player = playerState[socket.id];
+            // If in a room, handle forfeit/cleanup
+            if (player.currentRoom && rooms[player.currentRoom]) {
+                const room = rooms[player.currentRoom];
+                room.players = room.players.filter(id => id !== socket.id);
+                if (room.players.length === 0) delete rooms[player.currentRoom];
+            }
+            delete playerState[socket.id];
+        }
+        io.emit('statsUpdate', { online: Object.keys(playerState).length });
+    });
 });
 
-// Helper functions
-function getRoomSockets(room) {
-  if (!rooms[room]) return [];
-  return rooms[room].players.map(p => p.socketId);
-}
-
-function startGameCountdown(room) {
-  rooms[room].status = 'countdown';
-  let countdown = 10;
-  
-  const interval = setInterval(() => {
-    io.to(getRoomSockets(room)).emit('gameCountdown', {
-      room: room,
-      timer: countdown
-    });
-    
-    countdown--;
-    
-    if (countdown < 0) {
-      clearInterval(interval);
-      startGame(room);
-    }
-  }, 1000);
-}
-
-function startGame(room) {
-  rooms[room].status = 'playing';
-  
-  // Start drawing balls
-  let ballCount = 0;
-  const drawInterval = setInterval(() => {
-    if (ballCount >= 20 || rooms[room].players.length < 2) {
-      clearInterval(drawInterval);
-      endGameNoWinner(room);
-      return;
-    }
-    
-    const ball = Math.floor(Math.random() * 75) + 1;
-    rooms[room].calledNumbers.push(ball);
-    
-    io.to(getRoomSockets(room)).emit('ballDrawn', {
-      room: room,
-      num: ball
-    });
-    
-    ballCount++;
-  }, 5000);
-}
-
-function endGameNoWinner(room) {
-  io.to(getRoomSockets(room)).emit('gameOver', {
-    room: room,
-    winnerId: 'HOUSE',
-    winnerName: 'House',
-    prize: 0
-  });
-  
-  resetRoom(room);
-}
-
-function resetRoom(room) {
-  rooms[room].players = [];
-  rooms[room].takenBoxes = [];
-  rooms[room].status = 'waiting';
-  rooms[room].calledNumbers = [];
-}
-
-// Start server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`📊 Game rooms: 10, 20, 50, 100 ETB`);
-  console.log(`🔐 Admin password: ${ADMIN_PASSWORD}`);
-});
+// --- START SERVER ---
+mongoose.connect(MONGODB_URI)
+    .then(() => {
+        console.log('Connected to MongoDB');
+        server.listen(PORT, () => console.log(`Bingo Server running on port ${PORT}`));
+    })
+    .catch(err => console.error('MongoDB connection error:', err));
