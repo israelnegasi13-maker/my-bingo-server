@@ -40,19 +40,23 @@ const playerState = {}; // socketId -> data
 
 // --- HELPERS ---
 const updateBalance = async (telegramId, amount) => {
-    const user = await User.findOneAndUpdate(
-        { telegramId },
-        { $inc: { balance: amount } },
-        { new: true }
-    );
-    return user ? user.balance : 0;
+    try {
+        const user = await User.findOneAndUpdate(
+            { telegramId },
+            { $inc: { balance: amount } },
+            { new: true }
+        );
+        return user ? user.balance : 0;
+    } catch (err) {
+        console.error("Balance Update Error:", err);
+        return 0;
+    }
 };
 
 // --- SOCKET LOGIC ---
 io.on('connection', (socket) => {
     console.log(`New connection: ${socket.id}`);
 
-    // Auth triggered by initData from Telegram
     socket.on('auth', async (userData) => {
         try {
             const tId = userData.id ? userData.id.toString() : null;
@@ -64,7 +68,7 @@ io.on('connection', (socket) => {
                 user = await User.create({
                     telegramId: tId,
                     userName: userData.username || userData.first_name || "Guest",
-                    balance: 100 // Welcome Bonus
+                    balance: 100 
                 });
             }
 
@@ -88,11 +92,8 @@ io.on('connection', (socket) => {
                 userName: user.userName
             });
 
-            // Trigger UI balance update
             socket.emit('balanceRefreshed', user.balance);
             io.emit('statsUpdate', { online: Object.keys(playerState).length });
-            
-            // If admin is connected, update their list
             io.emit('playerListUpdate', Object.values(playerState));
         } catch (err) {
             console.error('Auth Error:', err);
@@ -123,7 +124,6 @@ io.on('connection', (socket) => {
             players: room.players.map(id => playerState[id].userName)
         });
 
-        // Matchmaking: Start game when 2 players join
         if (room.players.length === 2) {
             room.gameStatus = 'playing';
             for (const pid of room.players) {
@@ -165,7 +165,6 @@ io.on('connection', (socket) => {
                 msg: `Box ${playerState[winnerId].box} was the winner.` 
             });
 
-            // Cleanup
             room.players.forEach(pid => {
                 if (playerState[pid]) {
                     playerState[pid].currentRoom = null;
@@ -177,7 +176,6 @@ io.on('connection', (socket) => {
         io.emit('playerListUpdate', Object.values(playerState));
     });
 
-    // --- ADMIN PANEL EVENTS ---
     socket.on('adminLogin', (pass) => {
         if (pass === ADMIN_PASSWORD) {
             socket.emit('adminAuthSuccess');
@@ -193,12 +191,8 @@ io.on('connection', (socket) => {
             const amountToAdd = parseFloat(data.amount);
             const newBal = await updateBalance(targetPlayer.userId, amountToAdd);
             targetPlayer.balance = newBal;
-            
-            // Notify player
             io.to(data.socketId).emit('fundsAdded', { amount: amountToAdd, newBalance: newBal });
             io.to(data.socketId).emit('balanceRefreshed', newBal);
-            
-            // Refresh admin view
             io.emit('playerListUpdate', Object.values(playerState));
         }
     });
@@ -235,4 +229,9 @@ mongoose.connect(MONGODB_URI)
         console.log('✅ Connected to MongoDB Atlas');
         server.listen(PORT, () => console.log(`🚀 Bingo Server running on port ${PORT}`));
     })
-    .catch(err => console.error('❌ MongoDB Connection Error:', err));
+    .catch(err => {
+        console.error('❌ MongoDB Connection Error:', err);
+        // On Render, we still want the server to start even if DB fails initially
+        // so it doesn't "exit early" and fail the deployment.
+        server.listen(PORT, () => console.log(`🚀 Server started in emergency mode on port ${PORT}`));
+    });
