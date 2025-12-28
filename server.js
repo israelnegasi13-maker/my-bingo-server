@@ -21,26 +21,37 @@ const io = new Server(server, {
   cors: { origin: "*", methods: ["GET", "POST"] }
 });
 
-// Game State Management
+// Game Rooms State
 let rooms = {
-  "10": { players: {}, status: 'waiting', drawnBalls: [] },
-  "20": { players: {}, status: 'waiting', drawnBalls: [] },
-  "50": { players: {}, status: 'waiting', drawnBalls: [] },
-  "100": { players: {}, status: 'waiting', drawnBalls: [] }
+  "10": { players: {}, status: 'waiting', drawnBalls: [], timer: null },
+  "20": { players: {}, status: 'waiting', drawnBalls: [], timer: null },
+  "50": { players: {}, status: 'waiting', drawnBalls: [], timer: null },
+  "100": { players: {}, status: 'waiting', drawnBalls: [], timer: null }
 };
 
-// 2. Main Socket Connection
-io.on('connection', (socket) => {
-  console.log('New connection:', socket.id);
+// --- HELPER: SYNC ADMIN PANEL ---
+async function syncAdmin() {
+  const playersSnap = await db.ref('players').get();
+  const players = [];
+  playersSnap.forEach(snap => { players.push(snap.val()); });
+  
+  io.emit('admin:players', players); // Send list to Admin Panel
+  io.emit('admin:update', {
+    totalPlayers: players.length,
+    activeGames: Object.values(rooms).filter(r => r.status === 'playing').length
+  });
+}
 
-  // --- ADMIN AUTHENTICATION ---
+// 2. Socket Connection
+io.on('connection', (socket) => {
+  console.log('Connected:', socket.id);
+
+  // --- ADMIN LOGIN ---
   socket.on('admin:auth', (password) => {
-    if (password === "YOUR_SECRET_ADMIN_PASSWORD") { 
+    if (password === "YOUR_PASSWORD") { // SET YOUR PASSWORD HERE
       socket.isAdmin = true;
       socket.emit('admin:authSuccess');
-      syncAdminData();
-    } else {
-      socket.emit('admin:authError', "Invalid Password");
+      syncAdmin();
     }
   });
 
@@ -48,99 +59,117 @@ io.on('connection', (socket) => {
   socket.on('init', async (data) => {
     const userId = data.userId || socket.id;
     const userRef = db.ref(`players/${userId}`);
-    
     let snapshot = await userRef.get();
-    let userData;
+    
+    let userData = snapshot.exists() ? snapshot.val() : {
+      userId, userName: data.userName || "Player", balance: 0, isBanned: false
+    };
 
-    if (!snapshot.exists()) {
-      userData = {
-        userId: userId,
-        userName: data.userName || "Guest",
-        balance: 0.00,
-        socketId: socket.id,
-        isBanned: false
-      };
-      await userRef.set(userData);
-    } else {
-      userData = snapshot.val();
-      if (userData.isBanned) return socket.emit('banned');
-      await userRef.update({ socketId: socket.id });
-    }
-
+    userData.socketId = socket.id; // Update current socket
+    await userRef.set(userData);
+    
     socket.userId = userId;
     socket.emit('balanceUpdate', userData.balance);
-    syncAdminData();
+    syncAdmin();
   });
 
-  // --- ADMIN ACTIONS (ADD FUNDS / BAN) ---
+  // --- ADMIN: ADD FUNDS ---
   socket.on('admin:addFunds', async (data) => {
     if (!socket.isAdmin) return;
-    const userRef = db.ref(`players/${data.playerId}`);
+    const { playerId, amount } = data; // playerId here is the socketId from Admin Panel
     
-    await userRef.transaction((current) => {
-      if (current) {
-        current.balance = (parseFloat(current.balance) || 0) + parseFloat(data.amount);
-      }
-      return current;
-    });
+    // Find user by socketId in Firebase
+    const playersRef = db.ref('players');
+    const snap = await playersRef.orderByChild('socketId').equalTo(playerId).once('value');
+    
+    if (snap.exists()) {
+      const uid = Object.keys(snap.val())[0];
+      const userRef = db.ref(`players/${uid}`);
+      
+      await userRef.transaction(user => {
+        if (user) user.balance = (parseFloat(user.balance) || 0) + parseFloat(amount);
+        return user;
+      });
 
-    const updated = (await userRef.get()).val();
-    // Notify the player immediately if they are online
-    io.to(updated.socketId).emit('balanceUpdate', updated.balance);
-    syncAdminData();
+      const updated = (await userRef.get()).val();
+      // Send to Game Client (matches your HTML event name)
+      io.to(updated.socketId).emit('fundsAdded', { amount, newBalance: updated.balance });
+      io.to(updated.socketId).emit('balanceUpdate', updated.balance);
+      syncAdmin();
+    }
   });
 
-  // --- GAMEPLAY: JOINING A ROOM ---
+  // --- GAME LOGIC: JOIN ROOM ---
   socket.on('joinRoom', async (data) => {
     const { room, box, userName } = data;
     const userRef = db.ref(`players/${socket.userId}`);
-    const snap = await userRef.get();
-    const user = snap.val();
+    const user = (await userRef.get()).val();
 
     if (user.balance < parseFloat(room)) {
       return socket.emit('insufficientFunds');
     }
 
-    // Deduct from Firebase
     const newBalance = user.balance - parseFloat(room);
     await userRef.update({ balance: newBalance });
 
-    // Join Socket Room
     rooms[room].players[socket.id] = { userId: socket.userId, userName, box };
     socket.join(`room_${room}`);
 
     socket.emit('balanceUpdate', newBalance);
-    io.to(`room_${room}`).emit('lobbyUpdate', { 
-        room, 
-        count: Object.keys(rooms[room].players).length 
-    });
+    io.to(`room_${room}`).emit('lobbyUpdate', { room, count: Object.keys(rooms[room].players).length });
 
-    syncAdminData();
+    // Start Game if 2 or more players
+    if (Object.keys(rooms[room].players).length >= 2 && rooms[room].status === 'waiting') {
+      startBingoGame(room);
+    }
+    syncAdmin();
   });
 
   socket.on('disconnect', () => {
-    // Cleanup: Remove from rooms
     for (let r in rooms) {
       if (rooms[r].players[socket.id]) {
         delete rooms[r].players[socket.id];
         io.to(`room_${r}`).emit('lobbyUpdate', { room: r, count: Object.keys(rooms[r].players).length });
       }
     }
-    syncAdminData();
+    syncAdmin();
   });
 });
 
-// Helper to push updates to Admin Panel
-async function syncAdminData() {
-  const playersSnap = await db.ref('players').get();
-  const players = [];
-  playersSnap.forEach(snap => { players.push(snap.val()); });
+// --- BINGO ENGINE ---
+function startBingoGame(room) {
+  rooms[room].status = 'starting';
+  let countdown = 10;
   
-  io.emit('admin:players', players);
-  io.emit('admin:update', {
-    totalPlayers: players.length,
-    activeGames: Object.values(rooms).filter(r => r.status === 'playing').length
-  });
+  const timer = setInterval(() => {
+    io.to(`room_${room}`).emit('gameCountdown', { room, timer: countdown });
+    countdown--;
+
+    if (countdown < 0) {
+      clearInterval(timer);
+      rooms[room].status = 'playing';
+      rooms[room].drawnBalls = [];
+      runBallDrawer(room);
+    }
+  }, 1000);
+}
+
+function runBallDrawer(room) {
+  const ballInterval = setInterval(() => {
+    if (!rooms[room] || rooms[room].status !== 'playing') {
+      clearInterval(ballInterval);
+      return;
+    }
+
+    let ball;
+    do { ball = Math.floor(Math.random() * 75) + 1; } 
+    while (rooms[room].drawnBalls.includes(ball));
+
+    rooms[room].drawnBalls.push(ball);
+    io.to(`room_${room}`).emit('ballDrawn', { room, num: ball });
+
+    if (rooms[room].drawnBalls.length >= 75) clearInterval(ballInterval);
+  }, 4000);
 }
 
 const PORT = process.env.PORT || 3000;
