@@ -13,10 +13,13 @@
     "cors": "^2.8.5",
     "helmet": "^7.0.0"
   },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
   "engines": {
     "node": ">=16.0.0"
   },
-  "keywords": ["bingo", "game", "socket.io"],
+  "keywords": ["bingo", "game", "socket.io", "real-time"],
   "author": "Your Name",
   "license": "MIT"
 }
