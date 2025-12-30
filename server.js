@@ -37,6 +37,7 @@ const CONFIG = {
     50: 10,  // 10 ETB commission per player
     100: 20  // 20 ETB commission per player
   },
+  FOUR_CORNERS_BONUS: 50, // 50 ETB bonus for four corners win
   COUNTDOWN_TIMER: 30, // 30 seconds wait when 2 players join
   ROOM_STATUS_UPDATE_INTERVAL: 3000
 };
@@ -147,8 +148,37 @@ function generateBingoCard(seed) {
   return card;
 }
 
+// Check if the marked numbers form a four corners pattern
+function checkFourCorners(grid, markedNumbers) {
+  const marks = new Set(markedNumbers);
+  
+  // Four corners positions in a 5x5 grid (0-indexed):
+  // Top-left: index 0 (B1)
+  // Top-right: index 4 (B5)
+  // Bottom-left: index 20 (O1)
+  // Bottom-right: index 24 (O5)
+  
+  const topLeft = grid[0];
+  const topRight = grid[4];
+  const bottomLeft = grid[20];
+  const bottomRight = grid[24];
+  
+  // Check if all four corners are marked (or FREE, which is always marked)
+  const hasTopLeft = marks.has(topLeft) || topLeft === 'FREE';
+  const hasTopRight = marks.has(topRight) || topRight === 'FREE';
+  const hasBottomLeft = marks.has(bottomLeft) || bottomLeft === 'FREE';
+  const hasBottomRight = marks.has(bottomRight) || bottomRight === 'FREE';
+  
+  return hasTopLeft && hasTopRight && hasBottomLeft && hasBottomRight;
+}
+
 function checkBingoPattern(grid, markedNumbers) {
   const marks = new Set(markedNumbers);
+  
+  // First check if it's a four corners win
+  if (checkFourCorners(grid, markedNumbers)) {
+    return { win: true, pattern: 'fourCorners' };
+  }
   
   // Check rows
   for (let i = 0; i < 5; i++) {
@@ -161,7 +191,7 @@ function checkBingoPattern(grid, markedNumbers) {
         break;
       }
     }
-    if (rowComplete) return true;
+    if (rowComplete) return { win: true, pattern: 'standard' };
   }
   
   // Check columns
@@ -175,7 +205,7 @@ function checkBingoPattern(grid, markedNumbers) {
         break;
       }
     }
-    if (colComplete) return true;
+    if (colComplete) return { win: true, pattern: 'standard' };
   }
   
   // Check diagonals
@@ -193,7 +223,11 @@ function checkBingoPattern(grid, markedNumbers) {
     if (!marks.has(cell2) && cell2 !== 'FREE') diag2Complete = false;
   }
   
-  return diag1Complete || diag2Complete;
+  if (diag1Complete || diag2Complete) {
+    return { win: true, pattern: 'standard' };
+  }
+  
+  return { win: false, pattern: null };
 }
 
 function calculatePrize(room) {
@@ -387,7 +421,7 @@ function startGameTimer(room) {
   }, CONFIG.GAME_TIMER * 1000);
 }
 
-function endGame(roomStake, winnerUserId) {
+function endGame(roomStake, winnerUserId, isFourCornersWin = false) {
   const room = rooms.get(roomStake);
   if (!room || room.status !== 'playing') return;
   
@@ -397,12 +431,20 @@ function endGame(roomStake, winnerUserId) {
   let winnerName = 'HOUSE';
   let prize = 0;
   let houseEarnings = 0;
+  let bonus = 0;
   
   if (winnerUserId !== 'HOUSE') {
     const winner = users.get(winnerUserId);
     if (winner) {
       winnerName = winner.userName;
       prize = calculatePrize(room);
+      
+      // Apply 50 ETB bonus for four corners win
+      if (isFourCornersWin) {
+        bonus = CONFIG.FOUR_CORNERS_BONUS;
+        prize += bonus;
+      }
+      
       houseEarnings = calculateHouseEarnings(room);
       
       winner.balance += prize;
@@ -417,7 +459,8 @@ function endGame(roomStake, winnerUserId) {
         }
       }
       
-      logTransaction('WIN', winnerUserId, prize, roomStake);
+      // Log the win with pattern info
+      logTransaction(isFourCornersWin ? 'WIN_FOUR_CORNERS' : 'WIN', winnerUserId, prize, roomStake);
     }
   } else {
     houseEarnings = calculateHouseEarnings(room);
@@ -442,7 +485,9 @@ function endGame(roomStake, winnerUserId) {
               winnerId: winnerUserId,
               winnerName: winnerName,
               prize: prize,
-              houseEarnings: houseEarnings
+              houseEarnings: houseEarnings,
+              isFourCornersWin: isFourCornersWin,
+              bonus: bonus
             });
           }
         }
@@ -640,10 +685,11 @@ io.on('connection', (socket) => {
       return;
     }
     
-    const isValidBingo = checkBingoPattern(grid, marked);
+    const bingoResult = checkBingoPattern(grid, marked);
     
-    if (isValidBingo) {
-      endGame(room, userId);
+    if (bingoResult.win) {
+      const isFourCornersWin = bingoResult.pattern === 'fourCorners';
+      endGame(room, userId, isFourCornersWin);
     } else {
       socket.emit('error', 'Invalid bingo claim');
     }
@@ -870,8 +916,9 @@ app.get('/', (req, res) => {
         <h2>Server Status: <span style="color: green;">RUNNING</span></h2>
         <p>Connected Players: ${Array.from(socketToUser.keys()).length}</p>
         <p>Total Users: ${users.size}</p>
-        <p>Active Rooms: ${Array.from(rooms.values()).filter(r => r.status === 'playing').length}</p>
+        <p>Active Games: ${Array.from(rooms.values()).filter(r => r.status === 'playing').length}</p>
         <p>Server Time: ${new Date().toLocaleString()}</p>
+        <p style="color: #f59e0b; font-weight: bold;">🎯 Four Corners Bonus: ${CONFIG.FOUR_CORNERS_BONUS} ETB!</p>
       </div>
       <div class="bingo-letters">
         <div class="bingo-letter" style="background: #3b82f6;">B</div>
@@ -906,6 +953,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
     commissionStructure: CONFIG.HOUSE_COMMISSION,
+    fourCornersBonus: CONFIG.FOUR_CORNERS_BONUS,
     bingoLetters: BINGO_LETTERS
   });
 });
@@ -920,4 +968,5 @@ server.listen(PORT, () => {
   console.log(`⚠️  CHANGE THE ADMIN PASSWORD IN PRODUCTION!`);
   console.log(`⚡ Game Timing: ${CONFIG.COUNTDOWN_TIMER}s wait, ${CONFIG.GAME_TIMER}s between balls`);
   console.log(`🔤 BINGO Letters: B(1-15), I(16-30), N(31-45), G(46-60), O(61-75)`);
+  console.log(`🎯 Four Corners Bonus: ${CONFIG.FOUR_CORNERS_BONUS} ETB extra for corner wins!`);
 });
