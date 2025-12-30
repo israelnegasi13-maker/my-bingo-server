@@ -25,16 +25,20 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 // ========== GAME CONFIGURATION ==========
 const CONFIG = {
-  ADMIN_PASSWORD: "admin1234", // Change this!
+  ADMIN_PASSWORD: "admin1234",
   INITIAL_BALANCE: 0.00,
   ROOM_STAKES: [10, 20, 50, 100],
   MAX_PLAYERS_PER_ROOM: 50,
   GAME_TIMER: 3, // 3 seconds between balls
   MIN_PLAYERS_TO_START: 2,
-  HOUSE_COMMISSION: 0.05, // 5% commission
-  BINGO_PRIZE_MULTIPLIER: 4.75,
+  HOUSE_COMMISSION: { // FIXED: Commission per player based on room stake
+    10: 2,  // 2 ETB commission per player in 10 ETB room
+    20: 4,  // 4 ETB commission per player in 20 ETB room  
+    50: 10, // 10 ETB commission per player in 50 ETB room
+    100: 20 // 20 ETB commission per player in 100 ETB room
+  },
   COUNTDOWN_TIMER: 30, // 30 seconds wait when 2 players join
-  ROOM_STATUS_UPDATE_INTERVAL: 3000 // 3 seconds for room status updates
+  ROOM_STATUS_UPDATE_INTERVAL: 3000
 };
 
 // ========== DATA STORAGE ==========
@@ -118,10 +122,29 @@ function checkBingoPattern(grid, markedNumbers) {
   return diag1Complete || diag2Complete;
 }
 
+// FIXED: New calculation method
 function calculatePrize(room) {
-  const totalPot = room.players.size * room.stake;
-  const houseCut = totalPot * CONFIG.HOUSE_COMMISSION;
-  return (totalPot - houseCut) * CONFIG.BINGO_PRIZE_MULTIPLIER;
+  const playerCount = room.players.size;
+  const stake = room.stake;
+  const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
+  
+  // Each player contributes: stake - commission
+  const contributionPerPlayer = stake - commissionPerPlayer;
+  
+  // Total prize pool = contribution per player × number of players
+  const totalPrize = contributionPerPlayer * playerCount;
+  
+  return totalPrize;
+}
+
+// FIXED: Calculate house earnings for a room
+function calculateHouseEarnings(room) {
+  const playerCount = room.players.size;
+  const stake = room.stake;
+  const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
+  
+  // House earnings = commission per player × number of players
+  return commissionPerPlayer * playerCount;
 }
 
 function logTransaction(type, userId, amount, room, admin = false) {
@@ -147,7 +170,7 @@ function updateAdminPanel() {
   let houseBalance = 0;
   let totalWagered = 0;
   
-  // Calculate house balance (all player balances are held by house)
+  // Calculate house balance from all user balances
   users.forEach(user => {
     houseBalance += user.balance;
     totalWagered += user.totalWagered || 0;
@@ -195,13 +218,20 @@ function updateAdminPanel() {
       socket.emit('admin:players', userArray);
       
       socket.emit('admin:rooms', Array.from(rooms.entries()).reduce((obj, [stake, room]) => {
+        const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
+        const contributionPerPlayer = stake - commissionPerPlayer;
+        const potentialPrize = contributionPerPlayer * room.players.size;
+        
         obj[stake] = {
-          stake: room.stake,
+          stake: stake,
           playerCount: room.players.size,
           takenBoxes: Array.from(room.takenBoxes),
           status: room.status,
           currentBall: room.currentBall,
-          ballsDrawn: room.ballsDrawn
+          ballsDrawn: room.ballsDrawn,
+          commissionPerPlayer: commissionPerPlayer,
+          contributionPerPlayer: contributionPerPlayer,
+          potentialPrize: potentialPrize
         };
         return obj;
       }, {}));
@@ -214,11 +244,18 @@ function updateAdminPanel() {
 // Function to broadcast room status to all connected clients
 function broadcastRoomStatus() {
   const roomStatus = Array.from(rooms.entries()).reduce((obj, [stake, room]) => {
+    const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
+    const contributionPerPlayer = stake - commissionPerPlayer;
+    const potentialPrize = contributionPerPlayer * room.players.size;
+    
     obj[stake] = {
-      stake: room.stake,
+      stake: stake,
       playerCount: room.players.size,
       status: room.status,
-      takenBoxes: room.takenBoxes.size
+      takenBoxes: room.takenBoxes.size,
+      commissionPerPlayer: commissionPerPlayer,
+      contributionPerPlayer: contributionPerPlayer,
+      potentialPrize: potentialPrize
     };
     return obj;
   }, {});
@@ -290,12 +327,16 @@ function endGame(roomStake, winnerUserId) {
   
   let winnerName = 'HOUSE';
   let prize = 0;
+  let houseEarnings = 0;
   
   if (winnerUserId !== 'HOUSE') {
     const winner = users.get(winnerUserId);
     if (winner) {
       winnerName = winner.userName;
       prize = calculatePrize(room);
+      houseEarnings = calculateHouseEarnings(room);
+      
+      // Add prize to winner's balance
       winner.balance += prize;
       winner.totalWins = (winner.totalWins || 0) + 1;
       
@@ -310,7 +351,16 @@ function endGame(roomStake, winnerUserId) {
       }
       
       logTransaction('WIN', winnerUserId, prize, roomStake);
+      console.log(`Game ended in ${roomStake} ETB room: ${winnerName} won ${prize} ETB, House earned ${houseEarnings} ETB`);
     }
+  } else {
+    houseEarnings = calculateHouseEarnings(room);
+    console.log(`Game ended in ${roomStake} ETB room: HOUSE wins, House earned ${houseEarnings} ETB`);
+  }
+  
+  // Log house earnings
+  if (houseEarnings > 0) {
+    logTransaction('HOUSE_EARNINGS', 'HOUSE', houseEarnings, roomStake, false);
   }
   
   // Notify all players in room through all their sockets
@@ -329,7 +379,8 @@ function endGame(roomStake, winnerUserId) {
               room: roomStake,
               winnerId: winnerUserId,
               winnerName: winnerName,
-              prize: prize
+              prize: prize,
+              houseEarnings: houseEarnings
             });
           }
         }
@@ -458,7 +509,7 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Deduct stake from balance
+    // Deduct FULL stake from balance
     user.balance -= room;
     user.totalWagered = (user.totalWagered || 0) + room;
     user.currentRoom = room;
@@ -522,6 +573,7 @@ io.on('connection', (socket) => {
     socket.emit('joinedRoom');
     socket.emit('balanceUpdate', user.balance);
     
+    // Log the full stake transaction
     logTransaction('STAKE', userId, -room, room);
     updateAdminPanel();
     broadcastRoomStatus();
@@ -782,6 +834,7 @@ app.get('/', (req, res) => {
       <style>
         body { font-family: Arial, sans-serif; padding: 40px; text-align: center; }
         .status { padding: 20px; background: #f0f0f0; border-radius: 10px; margin: 20px auto; max-width: 600px; }
+        .commission-info { background: #fff3cd; padding: 15px; border-radius: 8px; margin: 20px auto; max-width: 600px; }
       </style>
     </head>
     <body>
@@ -792,6 +845,13 @@ app.get('/', (req, res) => {
         <p>Total Users: ${users.size}</p>
         <p>Active Rooms: ${Array.from(rooms.values()).filter(r => r.status === 'playing').length}</p>
         <p>Server Time: ${new Date().toLocaleString()}</p>
+      </div>
+      <div class="commission-info">
+        <h3>💰 Commission Structure</h3>
+        <p><strong>10 ETB Room:</strong> 2 ETB commission per player (8 ETB to pot)</p>
+        <p><strong>20 ETB Room:</strong> 4 ETB commission per player (16 ETB to pot)</p>
+        <p><strong>50 ETB Room:</strong> 10 ETB commission per player (40 ETB to pot)</p>
+        <p><strong>100 ETB Room:</strong> 20 ETB commission per player (80 ETB to pot)</p>
       </div>
       <div>
         <h3>Access Points:</h3>
@@ -818,7 +878,8 @@ app.get('/health', (req, res) => {
     connectedPlayers: socketToUser.size,
     totalUsers: users.size,
     uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    commissionStructure: CONFIG.HOUSE_COMMISSION
   });
 });
 
@@ -832,4 +893,9 @@ server.listen(PORT, () => {
   console.log(`⚠️  CHANGE THE ADMIN PASSWORD IN PRODUCTION!`);
   console.log(`⚡ Game Timing: ${CONFIG.COUNTDOWN_TIMER}s wait, ${CONFIG.GAME_TIMER}s between balls`);
   console.log(`🔄 Room status updates every ${CONFIG.ROOM_STATUS_UPDATE_INTERVAL/1000}s`);
+  console.log(`💰 Commission Structure:`);
+  console.log(`   - 10 ETB Room: 2 ETB commission per player (8 ETB to pot)`);
+  console.log(`   - 20 ETB Room: 4 ETB commission per player (16 ETB to pot)`);
+  console.log(`   - 50 ETB Room: 10 ETB commission per player (40 ETB to pot)`);
+  console.log(`   - 100 ETB Room: 20 ETB commission per player (80 ETB to pot)`);
 });
