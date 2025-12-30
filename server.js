@@ -29,10 +29,11 @@ const CONFIG = {
   INITIAL_BALANCE: 0.00,
   ROOM_STAKES: [10, 20, 50, 100],
   MAX_PLAYERS_PER_ROOM: 50,
-  GAME_TIMER: 30, // seconds between balls
+  GAME_TIMER: 3, // CHANGED: 3 seconds between balls
   MIN_PLAYERS_TO_START: 2,
   HOUSE_COMMISSION: 0.05, // 5% commission
-  BINGO_PRIZE_MULTIPLIER: 4.75
+  BINGO_PRIZE_MULTIPLIER: 4.75,
+  COUNTDOWN_TIMER: 30 // ADDED: 30 seconds wait when 2 players join
 };
 
 // ========== DATA STORAGE ==========
@@ -47,7 +48,7 @@ CONFIG.ROOM_STAKES.forEach(stake => {
     stake: stake,
     players: new Set(),
     takenBoxes: new Set(),
-    status: 'waiting', // waiting, playing, ended
+    status: 'waiting', // waiting, starting, playing, ended
     calledNumbers: new Set(),
     gameTimer: null,
     startTime: null,
@@ -225,7 +226,7 @@ function startGameTimer(room) {
     
     updateAdminPanel();
     
-  }, CONFIG.GAME_TIMER * 1000);
+  }, CONFIG.GAME_TIMER * 1000); // Now 3 seconds (3000ms)
 }
 
 function endGame(roomStake, winnerSocketId) {
@@ -393,8 +394,8 @@ io.on('connection', (socket) => {
     if (playerCount >= CONFIG.MIN_PLAYERS_TO_START && roomData.status === 'waiting') {
       roomData.status = 'starting';
       
-      // Start countdown
-      let countdown = 5;
+      // Start countdown - CHANGED FROM 5 to 30 seconds
+      let countdown = CONFIG.COUNTDOWN_TIMER;
       const countdownInterval = setInterval(() => {
         roomData.players.forEach(playerSocketId => {
           const s = io.sockets.sockets.get(playerSocketId);
@@ -649,4 +650,5 @@ server.listen(PORT, () => {
   console.log(`🎮 Game Client: http://localhost:${PORT}/game`);
   console.log(`🔑 Default Admin Password: ${CONFIG.ADMIN_PASSWORD}`);
   console.log(`⚠️  CHANGE THE ADMIN PASSWORD IN PRODUCTION!`);
+  console.log(`⚡ Game Timing: ${CONFIG.COUNTDOWN_TIMER}s wait, ${CONFIG.GAME_TIMER}s between balls`);
 });
