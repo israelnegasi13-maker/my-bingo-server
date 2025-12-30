@@ -208,7 +208,7 @@ function updateAdminPanel() {
   });
 }
 
-// NEW: Function to broadcast room status to all connected clients
+// Function to broadcast room status to all connected clients
 function broadcastRoomStatus() {
   const roomStatus = Array.from(rooms.entries()).reduce((obj, [stake, room]) => {
     obj[stake] = {
@@ -398,7 +398,7 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Get taken boxes for a room
+  // Get taken boxes for a room - FIXED: Ensure proper response
   socket.on('getTakenBoxes', ({ room }, callback) => {
     const roomData = rooms.get(parseInt(room));
     if (roomData) {
@@ -408,43 +408,56 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Join a room
-  socket.on('joinRoom', (data) => {
+  // Join a room - FIXED: Proper error handling and box validation
+  socket.on('joinRoom', (data, callback) => {
     const { room, box, userName } = data;
     const userId = socketToUser.get(socket.id);
     
     if (!userId) {
       socket.emit('error', 'Player not initialized');
+      if (callback) callback({ success: false, error: 'Player not initialized' });
       return;
     }
     
     const user = users.get(userId);
     if (!user) {
       socket.emit('error', 'User not found');
+      if (callback) callback({ success: false, error: 'User not found' });
       return;
     }
     
     // Check if player has enough balance
     if (user.balance < room) {
       socket.emit('insufficientFunds');
+      if (callback) callback({ success: false, error: 'Insufficient funds' });
       return;
     }
     
     const roomData = rooms.get(room);
     if (!roomData) {
       socket.emit('error', 'Invalid room');
+      if (callback) callback({ success: false, error: 'Invalid room' });
       return;
     }
     
     // Check if box is available
     if (roomData.takenBoxes.has(box)) {
       socket.emit('boxTaken');
+      if (callback) callback({ success: false, error: 'Box already taken' });
       return;
     }
     
     // Check if user is already in a room
     if (user.currentRoom) {
       socket.emit('error', 'Already in a room');
+      if (callback) callback({ success: false, error: 'Already in a room' });
+      return;
+    }
+    
+    // Check if room is full
+    if (roomData.takenBoxes.size >= CONFIG.MAX_PLAYERS_PER_ROOM) {
+      socket.emit('error', 'Room is full');
+      if (callback) callback({ success: false, error: 'Room is full' });
       return;
     }
     
@@ -518,30 +531,41 @@ io.on('connection', (socket) => {
     socket.emit('joinedRoom');
     socket.emit('balanceUpdate', user.balance);
     
+    if (callback) {
+      callback({ 
+        success: true, 
+        message: 'Successfully joined room',
+        playerCount: playerCount
+      });
+    }
+    
     logTransaction('STAKE', userId, -room, room);
     updateAdminPanel();
     broadcastRoomStatus();
   });
   
   // Claim bingo
-  socket.on('claimBingo', (data) => {
+  socket.on('claimBingo', (data, callback) => {
     const { room, grid, marked } = data;
     const userId = socketToUser.get(socket.id);
     
     if (!userId) {
       socket.emit('error', 'Not authenticated');
+      if (callback) callback({ success: false, error: 'Not authenticated' });
       return;
     }
     
     const user = users.get(userId);
     if (!user || user.currentRoom !== room) {
       socket.emit('error', 'Not in this room');
+      if (callback) callback({ success: false, error: 'Not in this room' });
       return;
     }
     
     const roomData = rooms.get(room);
     if (!roomData || roomData.status !== 'playing') {
       socket.emit('error', 'Game not in progress');
+      if (callback) callback({ success: false, error: 'Game not in progress' });
       return;
     }
     
@@ -550,20 +574,24 @@ io.on('connection', (socket) => {
     
     if (isValidBingo) {
       endGame(room, userId);
+      if (callback) callback({ success: true, message: 'Bingo verified!' });
     } else {
       socket.emit('error', 'Invalid bingo claim');
+      if (callback) callback({ success: false, error: 'Invalid bingo claim' });
     }
   });
   
   // ========== ADMIN EVENTS ==========
-  socket.on('admin:auth', (password) => {
+  socket.on('admin:auth', (password, callback) => {
     if (password === CONFIG.ADMIN_PASSWORD) {
       adminSockets.add(socket.id);
       socket.emit('admin:authSuccess');
       socket.emit('admin:getData');
       console.log(`Admin authenticated: ${socket.id}`);
+      if (callback) callback({ success: true });
     } else {
       socket.emit('admin:authError', 'Invalid password');
+      if (callback) callback({ success: false, error: 'Invalid password' });
     }
   });
   
@@ -571,15 +599,17 @@ io.on('connection', (socket) => {
     updateAdminPanel();
   });
   
-  socket.on('admin:addFunds', ({ userId, amount }) => {
+  socket.on('admin:addFunds', ({ userId, amount }, callback) => {
     if (!adminSockets.has(socket.id)) {
       socket.emit('admin:error', 'Unauthorized');
+      if (callback) callback({ success: false, error: 'Unauthorized' });
       return;
     }
     
     const user = users.get(userId);
     if (!user) {
       socket.emit('admin:error', 'User not found');
+      if (callback) callback({ success: false, error: 'User not found' });
       return;
     }
     
@@ -601,12 +631,14 @@ io.on('connection', (socket) => {
     
     logTransaction('ADMIN_ADD', userId, amount, null, true);
     socket.emit('admin:success', `Added ${amount} ETB to ${user.userName}`);
+    if (callback) callback({ success: true, newBalance: user.balance });
     updateAdminPanel();
   });
   
-  socket.on('admin:banPlayer', (userId) => {
+  socket.on('admin:banPlayer', (userId, callback) => {
     if (!adminSockets.has(socket.id)) {
       socket.emit('admin:error', 'Unauthorized');
+      if (callback) callback({ success: false, error: 'Unauthorized' });
       return;
     }
     
@@ -645,14 +677,19 @@ io.on('connection', (socket) => {
       }
       
       socket.emit('admin:success', `Player ${user.userName} banned`);
+      if (callback) callback({ success: true });
       updateAdminPanel();
       broadcastRoomStatus();
+    } else {
+      socket.emit('admin:error', 'User not found');
+      if (callback) callback({ success: false, error: 'User not found' });
     }
   });
   
-  socket.on('admin:forceDraw', (roomStake) => {
+  socket.on('admin:forceDraw', (roomStake, callback) => {
     if (!adminSockets.has(socket.id)) {
       socket.emit('admin:error', 'Unauthorized');
+      if (callback) callback({ success: false, error: 'Unauthorized' });
       return;
     }
     
@@ -683,7 +720,11 @@ io.on('connection', (socket) => {
       });
       
       socket.emit('admin:success', `Ball ${ball} drawn in ${roomStake} ETB room`);
+      if (callback) callback({ success: true, ball: ball });
       updateAdminPanel();
+    } else {
+      socket.emit('admin:error', 'Room not found or not playing');
+      if (callback) callback({ success: false, error: 'Room not found or not playing' });
     }
   });
   
