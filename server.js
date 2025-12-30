@@ -31,14 +31,23 @@ const CONFIG = {
   MAX_PLAYERS_PER_ROOM: 50,
   GAME_TIMER: 3, // 3 seconds between balls
   MIN_PLAYERS_TO_START: 2,
-  HOUSE_COMMISSION: { // FIXED: Commission per player based on room stake
-    10: 2,  // 2 ETB commission per player in 10 ETB room
-    20: 4,  // 4 ETB commission per player in 20 ETB room  
-    50: 10, // 10 ETB commission per player in 50 ETB room
-    100: 20 // 20 ETB commission per player in 100 ETB room
+  HOUSE_COMMISSION: { // Fixed commission per player
+    10: 2,   // 2 ETB commission per player
+    20: 4,   // 4 ETB commission per player  
+    50: 10,  // 10 ETB commission per player
+    100: 20  // 20 ETB commission per player
   },
   COUNTDOWN_TIMER: 30, // 30 seconds wait when 2 players join
   ROOM_STATUS_UPDATE_INTERVAL: 3000
+};
+
+// BINGO letter ranges
+const BINGO_LETTERS = {
+  'B': { min: 1, max: 15, color: '#3b82f6' },   // Blue
+  'I': { min: 16, max: 30, color: '#8b5cf6' },  // Purple
+  'N': { min: 31, max: 45, color: '#10b981' },  // Green
+  'G': { min: 46, max: 60, color: '#f59e0b' },  // Yellow
+  'O': { min: 61, max: 75, color: '#ef4444' }   // Red
 };
 
 // ========== DATA STORAGE ==========
@@ -71,6 +80,71 @@ function generateRandomNumbers(count, max) {
     numbers.add(Math.floor(Math.random() * max) + 1);
   }
   return Array.from(numbers);
+}
+
+// Get BINGO letter for a number
+function getBingoLetter(number) {
+  if (number >= 1 && number <= 15) return 'B';
+  if (number >= 16 && number <= 30) return 'I';
+  if (number >= 31 && number <= 45) return 'N';
+  if (number >= 46 && number <= 60) return 'G';
+  if (number >= 61 && number <= 75) return 'O';
+  return '';
+}
+
+// Generate traditional bingo card with letters
+function generateBingoCard(seed) {
+  const card = {
+    letters: ['B', 'I', 'N', 'G', 'O'],
+    numbers: []
+  };
+  
+  // Create a seeded random generator
+  function seededRandom(s) {
+    var mask = 0xffffffff;
+    var m_w = (123456789 + s) & mask;
+    var m_z = (987654321 - s) & mask;
+
+    return function() {
+      m_z = (36969 * (m_z & 65535) + (m_z >> 16)) & mask;
+      m_w = (18000 * (m_w & 65535) + (m_w >> 16)) & mask;
+      var result = ((m_z << 16) + (m_w & 65535)) >>> 0;
+      return result / 4294967296;
+    }
+  }
+
+  const random = seededRandom(seed * 777);
+  
+  // Generate numbers for each column (letter)
+  for (let col = 0; col < 5; col++) {
+    const letter = card.letters[col];
+    const range = BINGO_LETTERS[letter];
+    let numbersInColumn = [];
+    
+    // Generate 5 unique numbers for this column
+    for (let i = 0; i < 5; i++) {
+      let num;
+      do {
+        num = Math.floor(random() * (range.max - range.min + 1)) + range.min;
+      } while (numbersInColumn.includes(num));
+      numbersInColumn.push(num);
+    }
+    
+    // Sort numbers in column (optional, but traditional)
+    numbersInColumn.sort((a, b) => a - b);
+    
+    // Add to card numbers
+    for (let row = 0; row < 5; row++) {
+      const index = row * 5 + col;
+      if (col === 2 && row === 2) {
+        card.numbers[index] = 'FREE'; // Center is FREE
+      } else {
+        card.numbers[index] = numbersInColumn[row];
+      }
+    }
+  }
+  
+  return card;
 }
 
 function checkBingoPattern(grid, markedNumbers) {
@@ -122,28 +196,22 @@ function checkBingoPattern(grid, markedNumbers) {
   return diag1Complete || diag2Complete;
 }
 
-// FIXED: New calculation method
 function calculatePrize(room) {
   const playerCount = room.players.size;
   const stake = room.stake;
   const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
   
-  // Each player contributes: stake - commission
   const contributionPerPlayer = stake - commissionPerPlayer;
-  
-  // Total prize pool = contribution per player × number of players
   const totalPrize = contributionPerPlayer * playerCount;
   
   return totalPrize;
 }
 
-// FIXED: Calculate house earnings for a room
 function calculateHouseEarnings(room) {
   const playerCount = room.players.size;
   const stake = room.stake;
   const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
   
-  // House earnings = commission per player × number of players
   return commissionPerPlayer * playerCount;
 }
 
@@ -170,7 +238,6 @@ function updateAdminPanel() {
   let houseBalance = 0;
   let totalWagered = 0;
   
-  // Calculate house balance from all user balances
   users.forEach(user => {
     houseBalance += user.balance;
     totalWagered += user.totalWagered || 0;
@@ -187,10 +254,8 @@ function updateAdminPanel() {
         totalUsers: users.size
       });
       
-      // Convert users to array for admin panel
       const userArray = [];
       users.forEach((user, userId) => {
-        // Find if user is online
         let isOnline = false;
         let userSocketId = null;
         for (const [sId, uId] of socketToUser.entries()) {
@@ -241,7 +306,6 @@ function updateAdminPanel() {
   });
 }
 
-// Function to broadcast room status to all connected clients
 function broadcastRoomStatus() {
   const roomStatus = Array.from(rooms.entries()).reduce((obj, [stake, room]) => {
     const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
@@ -273,25 +337,31 @@ function startGameTimer(room) {
     }
     
     let ball;
+    let letter;
     do {
       ball = Math.floor(Math.random() * 75) + 1;
+      letter = getBingoLetter(ball);
     } while (room.calledNumbers.has(ball));
     
     room.calledNumbers.add(ball);
     room.currentBall = ball;
     room.ballsDrawn++;
     
+    // Emit ball with letter
+    const ballData = {
+      room: room.stake,
+      num: ball,
+      letter: letter,
+      fullDisplay: `${letter}-${ball}`
+    };
+    
     // Emit to all players in room
     room.players.forEach(userId => {
-      // Find all sockets for this user
       for (const [socketId, uId] of socketToUser.entries()) {
         if (uId === userId) {
           const socket = io.sockets.sockets.get(socketId);
           if (socket) {
-            socket.emit('ballDrawn', {
-              room: room.stake,
-              num: ball
-            });
+            socket.emit('ballDrawn', ballData);
           }
         }
       }
@@ -300,7 +370,6 @@ function startGameTimer(room) {
     // Enable bingo claiming after 5 balls
     if (room.ballsDrawn >= 5) {
       room.players.forEach(userId => {
-        // Find all sockets for this user
         for (const [socketId, uId] of socketToUser.entries()) {
           if (uId === userId) {
             const socket = io.sockets.sockets.get(socketId);
@@ -315,7 +384,7 @@ function startGameTimer(room) {
     updateAdminPanel();
     broadcastRoomStatus();
     
-  }, CONFIG.GAME_TIMER * 1000); // 3 seconds between balls
+  }, CONFIG.GAME_TIMER * 1000);
 }
 
 function endGame(roomStake, winnerUserId) {
@@ -336,11 +405,9 @@ function endGame(roomStake, winnerUserId) {
       prize = calculatePrize(room);
       houseEarnings = calculateHouseEarnings(room);
       
-      // Add prize to winner's balance
       winner.balance += prize;
       winner.totalWins = (winner.totalWins || 0) + 1;
       
-      // Notify winner through all their sockets
       for (const [socketId, userId] of socketToUser.entries()) {
         if (userId === winnerUserId) {
           const winnerSocket = io.sockets.sockets.get(socketId);
@@ -351,26 +418,21 @@ function endGame(roomStake, winnerUserId) {
       }
       
       logTransaction('WIN', winnerUserId, prize, roomStake);
-      console.log(`Game ended in ${roomStake} ETB room: ${winnerName} won ${prize} ETB, House earned ${houseEarnings} ETB`);
     }
   } else {
     houseEarnings = calculateHouseEarnings(room);
-    console.log(`Game ended in ${roomStake} ETB room: HOUSE wins, House earned ${houseEarnings} ETB`);
   }
   
-  // Log house earnings
   if (houseEarnings > 0) {
     logTransaction('HOUSE_EARNINGS', 'HOUSE', houseEarnings, roomStake, false);
   }
   
-  // Notify all players in room through all their sockets
   room.players.forEach(userId => {
     const user = users.get(userId);
     if (user) {
       user.currentRoom = null;
       user.box = null;
       
-      // Find all sockets for this user
       for (const [socketId, uId] of socketToUser.entries()) {
         if (uId === userId) {
           const socket = io.sockets.sockets.get(socketId);
@@ -388,7 +450,6 @@ function endGame(roomStake, winnerUserId) {
     }
   });
   
-  // Reset room after delay
   setTimeout(() => {
     room.players.clear();
     room.takenBoxes.clear();
@@ -406,11 +467,9 @@ function endGame(roomStake, winnerUserId) {
 io.on('connection', (socket) => {
   console.log(`New connection: ${socket.id}`);
   
-  // Initialize player
   socket.on('init', (data) => {
     const { userId, userName } = data;
     
-    // Create or get user
     let user = users.get(userId);
     if (!user) {
       user = {
@@ -426,14 +485,12 @@ io.on('connection', (socket) => {
       };
       users.set(userId, user);
     } else {
-      // Update last seen and user info
       user.lastSeen = new Date();
       if (userName && user.userName !== userName) {
         user.userName = userName;
       }
     }
     
-    // Map socket to user
     socketToUser.set(socket.id, userId);
     
     socket.emit('balanceUpdate', user.balance);
@@ -441,7 +498,6 @@ io.on('connection', (socket) => {
     broadcastRoomStatus();
   });
   
-  // Refresh balance
   socket.on('refreshBalance', () => {
     const userId = socketToUser.get(socket.id);
     if (userId) {
@@ -453,7 +509,6 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Get taken boxes for a room
   socket.on('getTakenBoxes', ({ room }, callback) => {
     const roomData = rooms.get(parseInt(room));
     if (roomData) {
@@ -463,7 +518,6 @@ io.on('connection', (socket) => {
     }
   });
   
-  // Join a room
   socket.on('joinRoom', (data) => {
     const { room, box, userName } = data;
     const userId = socketToUser.get(socket.id);
@@ -479,7 +533,6 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Check if player has enough balance
     if (user.balance < room) {
       socket.emit('insufficientFunds');
       return;
@@ -491,40 +544,31 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Check if box is available
     if (roomData.takenBoxes.has(box)) {
       socket.emit('boxTaken');
       return;
     }
     
-    // Check if user is already in a room
     if (user.currentRoom) {
-      // If user is already in this room, do nothing
       if (user.currentRoom === room) {
         socket.emit('joinedRoom');
         return;
       }
-      // If user is in a different room, send error
       socket.emit('error', 'Already in a different room');
       return;
     }
     
-    // Deduct FULL stake from balance
     user.balance -= room;
     user.totalWagered = (user.totalWagered || 0) + room;
     user.currentRoom = room;
     user.box = box;
     
-    // Add to room
     roomData.players.add(userId);
     roomData.takenBoxes.add(box);
     
-    // Update player count
     const playerCount = roomData.players.size;
     
-    // Notify all players in room through all their sockets
     roomData.players.forEach(playerUserId => {
-      // Find all sockets for this user
       for (const [sId, uId] of socketToUser.entries()) {
         if (uId === playerUserId) {
           const s = io.sockets.sockets.get(sId);
@@ -538,15 +582,12 @@ io.on('connection', (socket) => {
       }
     });
     
-    // Start game if enough players
     if (playerCount >= CONFIG.MIN_PLAYERS_TO_START && roomData.status === 'waiting') {
       roomData.status = 'starting';
       
-      // Start countdown - 30 seconds
       let countdown = CONFIG.COUNTDOWN_TIMER;
       const countdownInterval = setInterval(() => {
         roomData.players.forEach(playerUserId => {
-          // Find all sockets for this user
           for (const [sId, uId] of socketToUser.entries()) {
             if (uId === playerUserId) {
               const s = io.sockets.sockets.get(sId);
@@ -573,13 +614,11 @@ io.on('connection', (socket) => {
     socket.emit('joinedRoom');
     socket.emit('balanceUpdate', user.balance);
     
-    // Log the full stake transaction
     logTransaction('STAKE', userId, -room, room);
     updateAdminPanel();
     broadcastRoomStatus();
   });
   
-  // Claim bingo
   socket.on('claimBingo', (data) => {
     const { room, grid, marked } = data;
     const userId = socketToUser.get(socket.id);
@@ -601,7 +640,6 @@ io.on('connection', (socket) => {
       return;
     }
     
-    // Verify bingo pattern
     const isValidBingo = checkBingoPattern(grid, marked);
     
     if (isValidBingo) {
@@ -611,7 +649,6 @@ io.on('connection', (socket) => {
     }
   });
   
-  // ========== ADMIN EVENTS ==========
   socket.on('admin:auth', (password) => {
     if (password === CONFIG.ADMIN_PASSWORD) {
       adminSockets.add(socket.id);
@@ -641,7 +678,6 @@ io.on('connection', (socket) => {
     
     user.balance += parseFloat(amount);
     
-    // Notify user through all their sockets if online
     for (const [sId, uId] of socketToUser.entries()) {
       if (uId === userId) {
         const playerSocket = io.sockets.sockets.get(sId);
@@ -668,7 +704,6 @@ io.on('connection', (socket) => {
     
     const user = users.get(userId);
     if (user) {
-      // Kick player from any room
       if (user.currentRoom) {
         const room = rooms.get(user.currentRoom);
         if (room) {
@@ -679,7 +714,6 @@ io.on('connection', (socket) => {
         user.box = null;
       }
       
-      // Notify user through all their sockets
       for (const [sId, uId] of socketToUser.entries()) {
         if (uId === userId) {
           const playerSocket = io.sockets.sockets.get(sId);
@@ -690,10 +724,8 @@ io.on('connection', (socket) => {
         }
       }
       
-      // Remove from users map
       users.delete(userId);
       
-      // Remove socket mappings
       for (const [sId, uId] of socketToUser.entries()) {
         if (uId === userId) {
           socketToUser.delete(sId);
@@ -715,55 +747,54 @@ io.on('connection', (socket) => {
     const room = rooms.get(parseInt(roomStake));
     if (room && room.status === 'playing') {
       let ball;
+      let letter;
       do {
         ball = Math.floor(Math.random() * 75) + 1;
+        letter = getBingoLetter(ball);
       } while (room.calledNumbers.has(ball));
       
       room.calledNumbers.add(ball);
       room.currentBall = ball;
       room.ballsDrawn++;
       
+      const ballData = {
+        room: room.stake,
+        num: ball,
+        letter: letter,
+        fullDisplay: `${letter}-${ball}`
+      };
+      
       room.players.forEach(userId => {
-        // Find all sockets for this user
         for (const [sId, uId] of socketToUser.entries()) {
           if (uId === userId) {
             const s = io.sockets.sockets.get(sId);
             if (s) {
-              s.emit('ballDrawn', {
-                room: room.stake,
-                num: ball
-              });
+              s.emit('ballDrawn', ballData);
             }
           }
         }
       });
       
-      socket.emit('admin:success', `Ball ${ball} drawn in ${roomStake} ETB room`);
+      socket.emit('admin:success', `Ball ${letter}-${ball} drawn in ${roomStake} ETB room`);
       updateAdminPanel();
     }
   });
   
-  // Handle disconnect
   socket.on('disconnect', () => {
     console.log(`Disconnected: ${socket.id}`);
     
-    // Remove from admin sockets
     adminSockets.delete(socket.id);
     
-    // Handle player disconnect
     const userId = socketToUser.get(socket.id);
     if (userId) {
       const user = users.get(userId);
       
-      // Update last seen
       if (user) {
         user.lastSeen = new Date();
       }
       
-      // Remove socket mapping
       socketToUser.delete(socket.id);
       
-      // Check if user has any other active sockets
       let hasOtherConnections = false;
       for (const [sId, uId] of socketToUser.entries()) {
         if (uId === userId && io.sockets.sockets.get(sId)?.connected) {
@@ -772,10 +803,8 @@ io.on('connection', (socket) => {
         }
       }
       
-      // If no other connections, remove from room after timeout (in case of quick reconnect)
       if (!hasOtherConnections && user && user.currentRoom) {
         setTimeout(() => {
-          // Check again if user reconnected
           let reconnected = false;
           for (const [sId, uId] of socketToUser.entries()) {
             if (uId === userId && io.sockets.sockets.get(sId)?.connected) {
@@ -790,9 +819,7 @@ io.on('connection', (socket) => {
               room.players.delete(userId);
               room.takenBoxes.delete(user.box);
               
-              // Update remaining players
               room.players.forEach(playerUserId => {
-                // Find all sockets for this user
                 for (const [sId, uId] of socketToUser.entries()) {
                   if (uId === playerUserId) {
                     const s = io.sockets.sockets.get(sId);
@@ -811,7 +838,7 @@ io.on('connection', (socket) => {
               broadcastRoomStatus();
             }
           }
-        }, 10000); // 10 second grace period for reconnection
+        }, 10000);
       }
     }
     
@@ -819,7 +846,6 @@ io.on('connection', (socket) => {
   });
 });
 
-// Start broadcasting room status to all clients
 setInterval(() => {
   broadcastRoomStatus();
 }, CONFIG.ROOM_STATUS_UPDATE_INTERVAL);
@@ -834,7 +860,8 @@ app.get('/', (req, res) => {
       <style>
         body { font-family: Arial, sans-serif; padding: 40px; text-align: center; }
         .status { padding: 20px; background: #f0f0f0; border-radius: 10px; margin: 20px auto; max-width: 600px; }
-        .commission-info { background: #fff3cd; padding: 15px; border-radius: 8px; margin: 20px auto; max-width: 600px; }
+        .bingo-letters { display: flex; justify-content: center; gap: 20px; margin: 20px; }
+        .bingo-letter { width: 60px; height: 60px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: bold; color: white; }
       </style>
     </head>
     <body>
@@ -846,12 +873,12 @@ app.get('/', (req, res) => {
         <p>Active Rooms: ${Array.from(rooms.values()).filter(r => r.status === 'playing').length}</p>
         <p>Server Time: ${new Date().toLocaleString()}</p>
       </div>
-      <div class="commission-info">
-        <h3>💰 Commission Structure</h3>
-        <p><strong>10 ETB Room:</strong> 2 ETB commission per player (8 ETB to pot)</p>
-        <p><strong>20 ETB Room:</strong> 4 ETB commission per player (16 ETB to pot)</p>
-        <p><strong>50 ETB Room:</strong> 10 ETB commission per player (40 ETB to pot)</p>
-        <p><strong>100 ETB Room:</strong> 20 ETB commission per player (80 ETB to pot)</p>
+      <div class="bingo-letters">
+        <div class="bingo-letter" style="background: #3b82f6;">B</div>
+        <div class="bingo-letter" style="background: #8b5cf6;">I</div>
+        <div class="bingo-letter" style="background: #10b981;">N</div>
+        <div class="bingo-letter" style="background: #f59e0b;">G</div>
+        <div class="bingo-letter" style="background: #ef4444;">O</div>
       </div>
       <div>
         <h3>Access Points:</h3>
@@ -871,7 +898,6 @@ app.get('/game', (req, res) => {
   res.sendFile(path.join(__dirname, 'Finalized Chapter 2 (1).html'));
 });
 
-// Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
@@ -879,7 +905,8 @@ app.get('/health', (req, res) => {
     totalUsers: users.size,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
-    commissionStructure: CONFIG.HOUSE_COMMISSION
+    commissionStructure: CONFIG.HOUSE_COMMISSION,
+    bingoLetters: BINGO_LETTERS
   });
 });
 
@@ -892,10 +919,5 @@ server.listen(PORT, () => {
   console.log(`🔑 Default Admin Password: ${CONFIG.ADMIN_PASSWORD}`);
   console.log(`⚠️  CHANGE THE ADMIN PASSWORD IN PRODUCTION!`);
   console.log(`⚡ Game Timing: ${CONFIG.COUNTDOWN_TIMER}s wait, ${CONFIG.GAME_TIMER}s between balls`);
-  console.log(`🔄 Room status updates every ${CONFIG.ROOM_STATUS_UPDATE_INTERVAL/1000}s`);
-  console.log(`💰 Commission Structure:`);
-  console.log(`   - 10 ETB Room: 2 ETB commission per player (8 ETB to pot)`);
-  console.log(`   - 20 ETB Room: 4 ETB commission per player (16 ETB to pot)`);
-  console.log(`   - 50 ETB Room: 10 ETB commission per player (40 ETB to pot)`);
-  console.log(`   - 100 ETB Room: 20 ETB commission per player (80 ETB to pot)`);
+  console.log(`🔤 BINGO Letters: B(1-15), I(16-30), N(31-45), G(46-60), O(61-75)`);
 });
