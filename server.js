@@ -28,7 +28,7 @@ const CONFIG = {
   ADMIN_PASSWORD: "admin1234",
   INITIAL_BALANCE: 0.00,
   ROOM_STAKES: [10, 20, 50, 100],
-  MAX_PLAYERS_PER_ROOM: 50,
+  MAX_PLAYERS_PER_ROOM: 100,
   GAME_TIMER: 3, // 3 seconds between balls
   MIN_PLAYERS_TO_START: 2,
   HOUSE_COMMISSION: { // Fixed commission per player
@@ -586,6 +586,11 @@ io.on('connection', (socket) => {
     const roomData = rooms.get(room);
     if (!roomData) {
       socket.emit('error', 'Invalid room');
+      return;
+    }
+    
+    if (box < 1 || box > 100) {
+      socket.emit('error', 'Invalid box number. Must be between 1 and 100');
       return;
     }
     
