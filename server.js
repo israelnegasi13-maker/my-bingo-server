@@ -39,7 +39,10 @@ const CONFIG = {
   },
   FOUR_CORNERS_BONUS: 50, // 50 ETB bonus for four corners win
   COUNTDOWN_TIMER: 30, // 30 seconds wait when 2 players join
-  ROOM_STATUS_UPDATE_INTERVAL: 3000
+  ROOM_STATUS_UPDATE_INTERVAL: 3000,
+  MAX_TRANSACTIONS: 1000, // Store more transactions for admin panel
+  AUTO_SAVE_INTERVAL: 60000, // Auto-save every minute
+  SESSION_TIMEOUT: 86400000 // 24 hours
 };
 
 // BINGO letter ranges
@@ -57,6 +60,21 @@ let socketToUser = new Map(); // socket.id -> userId
 let rooms = new Map(); // stake -> room data
 let transactions = [];
 let adminSockets = new Set();
+let activityLog = []; // For admin activity tracking
+let systemStats = {
+  totalWagered: 0,
+  totalEarnings: 0,
+  totalGamesPlayed: 0,
+  totalBingos: 0,
+  totalFourCorners: 0,
+  dailyStats: {
+    date: new Date().toISOString().split('T')[0],
+    wagered: 0,
+    earnings: 0,
+    games: 0,
+    newUsers: 0
+  }
+};
 
 // Initialize rooms
 CONFIG.ROOM_STAKES.forEach(stake => {
@@ -70,7 +88,10 @@ CONFIG.ROOM_STAKES.forEach(stake => {
     startTime: null,
     currentBall: null,
     ballsDrawn: 0,
-    lastStatusUpdate: Date.now()
+    lastStatusUpdate: Date.now(),
+    gameHistory: [],
+    totalEarnings: 0,
+    totalGames: 0
   });
 });
 
@@ -262,32 +283,84 @@ function logTransaction(type, userId, amount, room, admin = false) {
     admin: admin
   };
   transactions.unshift(tx);
+  
+  // Limit transactions array size
+  if (transactions.length > CONFIG.MAX_TRANSACTIONS) {
+    transactions = transactions.slice(0, CONFIG.MAX_TRANSACTIONS);
+  }
+  
+  // Update system stats
+  if (type === 'STAKE') {
+    systemStats.totalWagered += Math.abs(amount);
+    systemStats.dailyStats.wagered += Math.abs(amount);
+  } else if (type === 'HOUSE_EARNINGS') {
+    systemStats.totalEarnings += amount;
+    systemStats.dailyStats.earnings += amount;
+  }
+  
   return tx;
+}
+
+function logActivity(type, details, adminSocketId = null) {
+  const activity = {
+    id: Date.now().toString(),
+    timestamp: new Date().toISOString(),
+    type: type,
+    details: details,
+    adminSocketId: adminSocketId
+  };
+  activityLog.unshift(activity);
+  
+  // Limit activity log size
+  if (activityLog.length > 200) {
+    activityLog = activityLog.slice(0, 200);
+  }
+  
+  // Broadcast to admin panels
+  adminSockets.forEach(socketId => {
+    const socket = io.sockets.sockets.get(socketId);
+    if (socket) {
+      socket.emit('admin:activity', activity);
+    }
+  });
+}
+
+function calculateHouseBalance() {
+  let houseBalance = 0;
+  
+  // Calculate from transactions
+  transactions.forEach(tx => {
+    if (tx.type === 'HOUSE_EARNINGS' || tx.type === 'HOUSE_ADJUST') {
+      houseBalance += tx.amount;
+    }
+  });
+  
+  return houseBalance;
 }
 
 function updateAdminPanel() {
   const totalPlayers = Array.from(socketToUser.keys()).length;
   const activeGames = Array.from(rooms.values()).filter(r => r.status === 'playing').length;
   
-  let houseBalance = 0;
-  let totalWagered = 0;
-  
-  users.forEach(user => {
-    houseBalance += user.balance;
-    totalWagered += user.totalWagered || 0;
-  });
+  const houseBalance = calculateHouseBalance();
   
   adminSockets.forEach(socketId => {
     const socket = io.sockets.sockets.get(socketId);
     if (socket) {
+      // Send basic stats
       socket.emit('admin:update', {
         totalPlayers,
         activeGames,
         houseBalance,
-        totalWagered,
-        totalUsers: users.size
+        totalWagered: systemStats.totalWagered,
+        totalUsers: users.size,
+        totalGames: systemStats.totalGamesPlayed,
+        totalBingos: systemStats.totalBingos,
+        totalFourCorners: systemStats.totalFourCorners,
+        dailyStats: systemStats.dailyStats
       });
       
+      // Send detailed user list
       const userArray = [];
       users.forEach((user, userId) => {
         let isOnline = false;
@@ -310,18 +383,22 @@ function updateAdminPanel() {
           joinedAt: user.joinedAt,
           isOnline: isOnline,
           totalWagered: user.totalWagered || 0,
-          totalWins: user.totalWins || 0
+          totalWins: user.totalWins || 0,
+          lastSeen: user.lastSeen || user.joinedAt
         });
       });
       
       socket.emit('admin:players', userArray);
       
-      socket.emit('admin:rooms', Array.from(rooms.entries()).reduce((obj, [stake, room]) => {
+      // Send room data
+      const roomData = {};
+      rooms.forEach((room, stake) => {
         const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
         const contributionPerPlayer = stake - commissionPerPlayer;
         const potentialPrize = contributionPerPlayer * room.players.size;
+        const houseFee = commissionPerPlayer * room.players.size;
         
-        obj[stake] = {
+        roomData[stake] = {
           stake: stake,
           playerCount: room.players.size,
           takenBoxes: Array.from(room.takenBoxes),
@@ -330,33 +407,43 @@ function updateAdminPanel() {
           ballsDrawn: room.ballsDrawn,
           commissionPerPlayer: commissionPerPlayer,
           contributionPerPlayer: contributionPerPlayer,
-          potentialPrize: potentialPrize
+          potentialPrize: potentialPrize,
+          houseFee: houseFee,
+          gameHistory: room.gameHistory.slice(-10) // Last 10 games
         };
-        return obj;
-      }, {}));
+      });
       
-      socket.emit('admin:transactions', transactions.slice(0, 50));
+      socket.emit('admin:rooms', roomData);
+      
+      // Send transactions
+      socket.emit('admin:transactions', transactions.slice(0, 100));
+      
+      // Send system stats
+      socket.emit('admin:systemStats', systemStats);
     }
   });
 }
 
 function broadcastRoomStatus() {
-  const roomStatus = Array.from(rooms.entries()).reduce((obj, [stake, room]) => {
+  const roomStatus = {};
+  rooms.forEach((room, stake) => {
     const commissionPerPlayer = CONFIG.HOUSE_COMMISSION[stake] || 0;
     const contributionPerPlayer = stake - commissionPerPlayer;
     const potentialPrize = contributionPerPlayer * room.players.size;
+    const houseFee = commissionPerPlayer * room.players.size;
     
-    obj[stake] = {
+    roomStatus[stake] = {
       stake: stake,
       playerCount: room.players.size,
       status: room.status,
       takenBoxes: room.takenBoxes.size,
       commissionPerPlayer: commissionPerPlayer,
       contributionPerPlayer: contributionPerPlayer,
-      potentialPrize: potentialPrize
+      potentialPrize: potentialPrize,
+      houseFee: houseFee,
+      currentBall: room.currentBall
     };
-    return obj;
-  }, {});
+  });
   
   io.emit('roomStatus', roomStatus);
 }
@@ -443,12 +530,18 @@ function endGame(roomStake, winnerUserId, isFourCornersWin = false) {
       if (isFourCornersWin) {
         bonus = CONFIG.FOUR_CORNERS_BONUS;
         prize += bonus;
+        systemStats.totalFourCorners++;
       }
       
       houseEarnings = calculateHouseEarnings(room);
       
       winner.balance += prize;
       winner.totalWins = (winner.totalWins || 0) + 1;
+      
+      // Update stats
+      systemStats.totalGamesPlayed++;
+      systemStats.totalBingos++;
+      systemStats.dailyStats.games++;
       
       for (const [socketId, userId] of socketToUser.entries()) {
         if (userId === winnerUserId) {
@@ -461,9 +554,33 @@ function endGame(roomStake, winnerUserId, isFourCornersWin = false) {
       
       // Log the win with pattern info
       logTransaction(isFourCornersWin ? 'WIN_FOUR_CORNERS' : 'WIN', winnerUserId, prize, roomStake);
+      
+      // Add to room history
+      room.gameHistory.push({
+        timestamp: new Date().toISOString(),
+        winner: winnerUserId,
+        winnerName: winnerName,
+        prize: prize,
+        players: room.players.size,
+        ballsDrawn: room.ballsDrawn,
+        isFourCorners: isFourCornersWin
+      });
     }
   } else {
     houseEarnings = calculateHouseEarnings(room);
+    systemStats.totalGamesPlayed++;
+    systemStats.dailyStats.games++;
+    
+    // Add to room history for house win
+    room.gameHistory.push({
+      timestamp: new Date().toISOString(),
+      winner: 'HOUSE',
+      winnerName: 'HOUSE',
+      prize: 0,
+      players: room.players.size,
+      ballsDrawn: room.ballsDrawn,
+      isFourCorners: false
+    });
   }
   
   if (houseEarnings > 0) {
@@ -508,6 +625,109 @@ function endGame(roomStake, winnerUserId, isFourCornersWin = false) {
   }, 5000);
 }
 
+// ========== NEW ADMIN FUNCTIONS ==========
+function getPlayerDetails(userId) {
+  const user = users.get(userId);
+  if (!user) return null;
+  
+  const userTransactions = transactions.filter(tx => tx.userId === userId);
+  const userGames = userTransactions.filter(tx => tx.type === 'WIN' || tx.type === 'WIN_FOUR_CORNERS' || tx.type === 'STAKE');
+  
+  return {
+    user: user,
+    transactions: userTransactions.slice(0, 50),
+    games: userGames,
+    winRate: user.totalWins > 0 ? ((user.totalWins / userGames.length) * 100).toFixed(2) : 0
+  };
+}
+
+function getDailyReport() {
+  const today = new Date().toISOString().split('T')[0];
+  const todayTransactions = transactions.filter(tx => tx.timestamp.startsWith(today));
+  
+  const report = {
+    date: today,
+    totalUsers: users.size,
+    newUsers: systemStats.dailyStats.newUsers,
+    totalWagered: systemStats.dailyStats.wagered,
+    totalEarnings: systemStats.dailyStats.earnings,
+    totalGames: systemStats.dailyStats.games,
+    transactions: todayTransactions.length,
+    topPlayers: []
+  };
+  
+  // Get top 5 players by wagering today
+  const playerWagers = new Map();
+  todayTransactions.forEach(tx => {
+    if (tx.type === 'STAKE') {
+      const amount = Math.abs(tx.amount);
+      playerWagers.set(tx.userId, (playerWagers.get(tx.userId) || 0) + amount);
+    }
+  });
+  
+  report.topPlayers = Array.from(playerWagers.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 5)
+    .map(([userId, amount]) => ({
+      userId,
+      userName: users.get(userId)?.userName || 'Unknown',
+      amount
+    }));
+  
+  return report;
+}
+
+function forceStartGame(roomStake) {
+  const room = rooms.get(roomStake);
+  if (!room || room.status !== 'waiting') return false;
+  
+  room.status = 'starting';
+  let countdown = 5; // Shorter countdown for forced start
+  
+  const countdownInterval = setInterval(() => {
+    room.players.forEach(playerUserId => {
+      for (const [sId, uId] of socketToUser.entries()) {
+        if (uId === playerUserId) {
+          const s = io.sockets.sockets.get(sId);
+          if (s) {
+            s.emit('gameCountdown', {
+              room: roomStake,
+              timer: countdown
+            });
+          }
+        }
+      }
+    });
+    
+    countdown--;
+    
+    if (countdown < 0) {
+      clearInterval(countdownInterval);
+      room.status = 'playing';
+      startGameTimer(room);
+      return true;
+    }
+  }, 1000);
+  
+  return true;
+}
+
+function broadcastToPlayers(message, type = 'info') {
+  const broadcastData = {
+    message: message,
+    type: type,
+    timestamp: new Date().toISOString()
+  };
+  
+  // Broadcast to all connected players
+  io.emit('adminBroadcast', broadcastData);
+  
+  // Log activity
+  logActivity('BROADCAST', { message: message, type: type });
+  
+  return broadcastData;
+}
+
 // ========== SOCKET.IO EVENT HANDLERS ==========
 io.on('connection', (socket) => {
   console.log(`New connection: ${socket.id}`);
@@ -526,11 +746,29 @@ io.on('connection', (socket) => {
         joinedAt: new Date(),
         totalWagered: 0,
         totalWins: 0,
-        lastSeen: new Date()
+        lastSeen: new Date(),
+        sessionCount: 1,
+        referralCode: generateReferralCode(userId)
       };
       users.set(userId, user);
+      
+      // Update daily new users
+      const today = new Date().toISOString().split('T')[0];
+      if (today !== systemStats.dailyStats.date) {
+        // Reset daily stats for new day
+        systemStats.dailyStats = {
+          date: today,
+          wagered: 0,
+          earnings: 0,
+          games: 0,
+          newUsers: 1
+        };
+      } else {
+        systemStats.dailyStats.newUsers++;
+      }
     } else {
       user.lastSeen = new Date();
+      user.sessionCount = (user.sessionCount || 0) + 1;
       if (userName && user.userName !== userName) {
         user.userName = userName;
       }
@@ -539,6 +777,13 @@ io.on('connection', (socket) => {
     socketToUser.set(socket.id, userId);
     
     socket.emit('balanceUpdate', user.balance);
+    socket.emit('userData', {
+      userId: userId,
+      userName: user.userName,
+      referralCode: user.referralCode,
+      joinedAt: user.joinedAt
+    });
+    
     updateAdminPanel();
     broadcastRoomStatus();
   });
@@ -700,11 +945,19 @@ io.on('connection', (socket) => {
     }
   });
   
+  // ========== ENHANCED ADMIN EVENTS ==========
   socket.on('admin:auth', (password) => {
     if (password === CONFIG.ADMIN_PASSWORD) {
       adminSockets.add(socket.id);
       socket.emit('admin:authSuccess');
       socket.emit('admin:getData');
+      
+      // Send initial data
+      updateAdminPanel();
+      
+      // Log activity
+      logActivity('ADMIN_LOGIN', { socketId: socket.id }, socket.id);
+      
       console.log(`Admin authenticated: ${socket.id}`);
     } else {
       socket.emit('admin:authError', 'Invalid password');
@@ -712,6 +965,10 @@ io.on('connection', (socket) => {
   });
   
   socket.on('admin:getData', () => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
     updateAdminPanel();
   });
   
@@ -727,6 +984,7 @@ io.on('connection', (socket) => {
       return;
     }
     
+    const oldBalance = user.balance;
     user.balance += parseFloat(amount);
     
     for (const [sId, uId] of socketToUser.entries()) {
@@ -743,6 +1001,7 @@ io.on('connection', (socket) => {
     }
     
     logTransaction('ADMIN_ADD', userId, amount, null, true);
+    logActivity('ADMIN_ADD_FUNDS', { userId, amount, oldBalance, newBalance: user.balance }, socket.id);
     socket.emit('admin:success', `Added ${amount} ETB to ${user.userName}`);
     updateAdminPanel();
   });
@@ -783,6 +1042,7 @@ io.on('connection', (socket) => {
         }
       }
       
+      logActivity('ADMIN_BAN', { userId, userName: user.userName }, socket.id);
       socket.emit('admin:success', `Player ${user.userName} banned`);
       updateAdminPanel();
       broadcastRoomStatus();
@@ -826,9 +1086,158 @@ io.on('connection', (socket) => {
         }
       });
       
+      logActivity('ADMIN_FORCE_DRAW', { room: roomStake, ball: ballData }, socket.id);
       socket.emit('admin:success', `Ball ${letter}-${ball} drawn in ${roomStake} ETB room`);
       updateAdminPanel();
     }
+  });
+  
+  // New admin events for enhanced panel
+  socket.on('admin:broadcast', (message) => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
+    
+    const broadcastData = broadcastToPlayers(message, 'info');
+    logActivity('ADMIN_BROADCAST', { message }, socket.id);
+    socket.emit('admin:success', `Broadcast sent: "${message}"`);
+  });
+  
+  socket.on('admin:adjustHouse', (amount) => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
+    
+    logTransaction('HOUSE_ADJUST', 'HOUSE', parseFloat(amount), null, true);
+    logActivity('ADMIN_ADJUST_HOUSE', { amount }, socket.id);
+    updateAdminPanel();
+    socket.emit('admin:success', `House balance adjusted by ${amount} ETB`);
+  });
+  
+  socket.on('admin:getPlayer', (userId, callback) => {
+    if (!adminSockets.has(socket.id)) {
+      return callback({ error: 'Unauthorized' });
+    }
+    
+    const playerDetails = getPlayerDetails(userId);
+    if (playerDetails) {
+      callback(playerDetails);
+    } else {
+      callback({ error: 'Player not found' });
+    }
+  });
+  
+  socket.on('admin:sendMessage', ({ userId, message }) => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
+    
+    let sent = false;
+    for (const [sId, uId] of socketToUser.entries()) {
+      if (uId === userId) {
+        const playerSocket = io.sockets.sockets.get(sId);
+        if (playerSocket) {
+          playerSocket.emit('adminMessage', {
+            message: message,
+            timestamp: new Date().toISOString()
+          });
+          sent = true;
+        }
+      }
+    }
+    
+    if (sent) {
+      logActivity('ADMIN_MESSAGE', { userId, message }, socket.id);
+      socket.emit('admin:success', `Message sent to user ${userId}`);
+    } else {
+      socket.emit('admin:error', 'User not found or not online');
+    }
+  });
+  
+  socket.on('admin:forceStart', (roomStake) => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
+    
+    const success = forceStartGame(parseInt(roomStake));
+    if (success) {
+      logActivity('ADMIN_FORCE_START', { room: roomStake }, socket.id);
+      socket.emit('admin:success', `Forced start in ${roomStake} ETB room`);
+    } else {
+      socket.emit('admin:error', `Cannot force start ${roomStake} ETB room`);
+    }
+  });
+  
+  socket.on('admin:forceEnd', (roomStake) => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
+    
+    const room = rooms.get(parseInt(roomStake));
+    if (room && (room.status === 'playing' || room.status === 'starting')) {
+      endGame(room.stake, 'HOUSE');
+      logActivity('ADMIN_FORCE_END', { room: roomStake }, socket.id);
+      socket.emit('admin:success', `Forced game end in ${roomStake} ETB room`);
+    } else {
+      socket.emit('admin:error', `No active game in ${roomStake} ETB room`);
+    }
+  });
+  
+  socket.on('admin:getReport', (reportType, callback) => {
+    if (!adminSockets.has(socket.id)) {
+      return callback({ error: 'Unauthorized' });
+    }
+    
+    switch(reportType) {
+      case 'daily':
+        callback(getDailyReport());
+        break;
+      case 'weekly':
+        // Implement weekly report
+        callback({ message: 'Weekly report coming soon' });
+        break;
+      default:
+        callback({ error: 'Invalid report type' });
+    }
+  });
+  
+  socket.on('admin:resetStats', () => {
+    if (!adminSockets.has(socket.id)) {
+      socket.emit('admin:error', 'Unauthorized');
+      return;
+    }
+    
+    systemStats = {
+      totalWagered: 0,
+      totalEarnings: 0,
+      totalGamesPlayed: 0,
+      totalBingos: 0,
+      totalFourCorners: 0,
+      dailyStats: {
+        date: new Date().toISOString().split('T')[0],
+        wagered: 0,
+        earnings: 0,
+        games: 0,
+        newUsers: 0
+      }
+    };
+    
+    logActivity('ADMIN_RESET_STATS', {}, socket.id);
+    updateAdminPanel();
+    socket.emit('admin:success', 'Statistics reset successfully');
+  });
+  
+  socket.on('admin:getActivity', (callback) => {
+    if (!adminSockets.has(socket.id)) {
+      return callback({ error: 'Unauthorized' });
+    }
+    
+    callback(activityLog.slice(0, 50));
   });
   
   socket.on('disconnect', () => {
@@ -897,9 +1306,45 @@ io.on('connection', (socket) => {
   });
 });
 
+// Helper function to generate referral code
+function generateReferralCode(userId) {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+  let code = '';
+  for (let i = 0; i < 6; i++) {
+    code += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return code + userId.slice(-4);
+}
+
+// Periodic tasks
 setInterval(() => {
   broadcastRoomStatus();
 }, CONFIG.ROOM_STATUS_UPDATE_INTERVAL);
+
+// Auto-save system stats (in a real app, this would save to a database)
+setInterval(() => {
+  console.log(`[${new Date().toISOString()}] System Stats:`, {
+    totalUsers: users.size,
+    onlinePlayers: socketToUser.size,
+    houseBalance: calculateHouseBalance(),
+    totalWagered: systemStats.totalWagered
+  });
+}, CONFIG.AUTO_SAVE_INTERVAL);
+
+// Daily stats reset
+setInterval(() => {
+  const today = new Date().toISOString().split('T')[0];
+  if (today !== systemStats.dailyStats.date) {
+    systemStats.dailyStats = {
+      date: today,
+      wagered: 0,
+      earnings: 0,
+      games: 0,
+      newUsers: 0
+    };
+    console.log('Daily stats reset for new day:', today);
+  }
+}, 3600000); // Check every hour
 
 // ========== EXPRESS ROUTES ==========
 app.get('/', (req, res) => {
@@ -909,33 +1354,80 @@ app.get('/', (req, res) => {
     <head>
       <title>Bingo Elite Server</title>
       <style>
-        body { font-family: Arial, sans-serif; padding: 40px; text-align: center; }
-        .status { padding: 20px; background: #f0f0f0; border-radius: 10px; margin: 20px auto; max-width: 600px; }
-        .bingo-letters { display: flex; justify-content: center; gap: 20px; margin: 20px; }
-        .bingo-letter { width: 60px; height: 60px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: bold; color: white; }
+        body { font-family: Arial, sans-serif; padding: 40px; text-align: center; background: #0f172a; color: #f8fafc; }
+        .container { max-width: 800px; margin: 0 auto; }
+        .status { padding: 30px; background: #1e293b; border-radius: 20px; margin: 30px auto; border: 1px solid #334155; }
+        .bingo-letters { display: flex; justify-content: center; gap: 20px; margin: 30px; }
+        .bingo-letter { width: 70px; height: 70px; border-radius: 50%; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: bold; color: white; }
+        .stats-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; margin: 30px 0; }
+        .stat { background: rgba(255,255,255,0.05); padding: 20px; border-radius: 12px; }
+        .stat-value { font-size: 2.5rem; font-weight: 900; margin: 10px 0; }
+        .stat-label { font-size: 0.9rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 1px; }
+        .btn { display: inline-block; padding: 15px 30px; margin: 10px; background: #3b82f6; color: white; text-decoration: none; border-radius: 12px; font-weight: bold; transition: all 0.3s; }
+        .btn:hover { background: #2563eb; transform: translateY(-2px); }
+        .btn-admin { background: #ef4444; }
+        .btn-admin:hover { background: #dc2626; }
+        .btn-game { background: #10b981; }
+        .btn-game:hover { background: #059669; }
       </style>
     </head>
     <body>
-      <h1>🎮 Bingo Elite Server</h1>
-      <div class="status">
-        <h2>Server Status: <span style="color: green;">RUNNING</span></h2>
-        <p>Connected Players: ${Array.from(socketToUser.keys()).length}</p>
-        <p>Total Users: ${users.size}</p>
-        <p>Active Games: ${Array.from(rooms.values()).filter(r => r.status === 'playing').length}</p>
-        <p>Server Time: ${new Date().toLocaleString()}</p>
-        <p style="color: #f59e0b; font-weight: bold;">🎯 Four Corners Bonus: ${CONFIG.FOUR_CORNERS_BONUS} ETB!</p>
-      </div>
-      <div class="bingo-letters">
-        <div class="bingo-letter" style="background: #3b82f6;">B</div>
-        <div class="bingo-letter" style="background: #8b5cf6;">I</div>
-        <div class="bingo-letter" style="background: #10b981;">N</div>
-        <div class="bingo-letter" style="background: #f59e0b;">G</div>
-        <div class="bingo-letter" style="background: #ef4444;">O</div>
-      </div>
-      <div>
-        <h3>Access Points:</h3>
-        <p><a href="/admin" target="_blank">Admin Panel</a></p>
-        <p><a href="/game" target="_blank">Game Client</a></p>
+      <div class="container">
+        <h1 style="font-size: 3rem; margin-bottom: 20px;">🎮 Bingo Elite Server</h1>
+        <p style="color: #94a3b8; font-size: 1.2rem;">Professional Bingo Gaming Platform</p>
+        
+        <div class="status">
+          <h2 style="color: #10b981;">🚀 Server Status: RUNNING</h2>
+          <div class="stats-grid">
+            <div class="stat">
+              <div class="stat-label">Connected Players</div>
+              <div class="stat-value">${Array.from(socketToUser.keys()).length}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Total Users</div>
+              <div class="stat-value">${users.size}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">Active Games</div>
+              <div class="stat-value">${Array.from(rooms.values()).filter(r => r.status === 'playing').length}</div>
+            </div>
+            <div class="stat">
+              <div class="stat-label">House Balance</div>
+              <div class="stat-value">${calculateHouseBalance().toFixed(2)} ETB</div>
+            </div>
+          </div>
+          <p style="margin-top: 20px; color: #f59e0b; font-weight: bold;">🎯 Four Corners Bonus: ${CONFIG.FOUR_CORNERS_BONUS} ETB!</p>
+          <p style="color: #64748b; margin-top: 10px;">Server Time: ${new Date().toLocaleString()}</p>
+        </div>
+        
+        <div class="bingo-letters">
+          <div class="bingo-letter" style="background: #3b82f6;">B</div>
+          <div class="bingo-letter" style="background: #8b5cf6;">I</div>
+          <div class="bingo-letter" style="background: #10b981;">N</div>
+          <div class="bingo-letter" style="background: #f59e0b;">G</div>
+          <div class="bingo-letter" style="background: #ef4444;">O</div>
+        </div>
+        
+        <div style="margin-top: 40px;">
+          <h3>Access Points:</h3>
+          <div>
+            <a href="/admin" class="btn btn-admin" target="_blank">🔒 Admin Panel</a>
+            <a href="/game" class="btn btn-game" target="_blank">🎮 Game Client</a>
+          </div>
+          <div style="margin-top: 20px;">
+            <a href="/health" class="btn" style="background: #64748b;" target="_blank">📊 Health Check</a>
+            <a href="/stats" class="btn" style="background: #8b5cf6;" target="_blank">📈 Statistics</a>
+          </div>
+        </div>
+        
+        <div style="margin-top: 40px; padding: 20px; background: rgba(255,255,255,0.03); border-radius: 12px;">
+          <h4>System Information</h4>
+          <p style="color: #94a3b8; font-size: 0.9rem;">
+            Version: 2.0.0 | Uptime: ${Math.floor(process.uptime() / 60)} minutes<br>
+            Room Stakes: ${CONFIG.ROOM_STAKES.join(', ')} ETB<br>
+            Commission Structure: ${JSON.stringify(CONFIG.HOUSE_COMMISSION)}
+          </p>
+        </div>
       </div>
     </body>
     </html>
@@ -943,11 +1435,11 @@ app.get('/', (req, res) => {
 });
 
 app.get('/admin', (req, res) => {
-  res.sendFile(path.join(__dirname, 'Admin panel (1).html'));
+  res.sendFile(path.join(__dirname, 'the updated admin pannel.html'));
 });
 
 app.get('/game', (req, res) => {
-  res.sendFile(path.join(__dirname, 'Finalized Chapter 2 (1).html'));
+  res.sendFile(path.join(__dirname, 'finilized chapter 8.html'));
 });
 
 app.get('/health', (req, res) => {
@@ -955,23 +1447,69 @@ app.get('/health', (req, res) => {
     status: 'ok',
     connectedPlayers: socketToUser.size,
     totalUsers: users.size,
+    activeGames: Array.from(rooms.values()).filter(r => r.status === 'playing').length,
     uptime: process.uptime(),
     timestamp: new Date().toISOString(),
+    serverTime: new Date().toLocaleString(),
+    memoryUsage: process.memoryUsage(),
     commissionStructure: CONFIG.HOUSE_COMMISSION,
     fourCornersBonus: CONFIG.FOUR_CORNERS_BONUS,
     bingoLetters: BINGO_LETTERS
   });
 });
 
+app.get('/stats', (req, res) => {
+  const roomStats = {};
+  rooms.forEach((room, stake) => {
+    roomStats[stake] = {
+      players: room.players.size,
+      status: room.status,
+      takenBoxes: room.takenBoxes.size,
+      currentBall: room.currentBall,
+      ballsDrawn: room.ballsDrawn,
+      totalGames: room.totalGames,
+      totalEarnings: room.totalEarnings
+    };
+  });
+  
+  res.json({
+    systemStats: systemStats,
+    houseBalance: calculateHouseBalance(),
+    roomStats: roomStats,
+    userStats: {
+      total: users.size,
+      online: socketToUser.size,
+      topPlayers: Array.from(users.entries())
+        .filter(([id, user]) => user.totalWagered > 0)
+        .sort((a, b) => b[1].totalWagered - a[1].totalWagered)
+        .slice(0, 5)
+        .map(([id, user]) => ({
+          name: user.userName,
+          wagered: user.totalWagered,
+          wins: user.totalWins || 0
+        }))
+    }
+  });
+});
+
 // ========== START SERVER ==========
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-  console.log(`🌐 Admin Panel: http://localhost:${PORT}/admin`);
-  console.log(`🎮 Game Client: http://localhost:${PORT}/game`);
-  console.log(`🔑 Default Admin Password: ${CONFIG.ADMIN_PASSWORD}`);
-  console.log(`⚠️  CHANGE THE ADMIN PASSWORD IN PRODUCTION!`);
-  console.log(`⚡ Game Timing: ${CONFIG.COUNTDOWN_TIMER}s wait, ${CONFIG.GAME_TIMER}s between balls`);
-  console.log(`🔤 BINGO Letters: B(1-15), I(16-30), N(31-45), G(46-60), O(61-75)`);
-  console.log(`🎯 Four Corners Bonus: ${CONFIG.FOUR_CORNERS_BONUS} ETB extra for corner wins!`);
+  console.log(`╔══════════════════════════════════════════════════════╗`);
+  console.log(`║                🚀 BINGO ELITE SERVER                ║`);
+  console.log(`╠══════════════════════════════════════════════════════╣`);
+  console.log(`║  Port:          ${PORT.toString().padEnd(40)}║`);
+  console.log(`║  Admin Panel:   http://localhost:${PORT}/admin        ║`);
+  console.log(`║  Game Client:   http://localhost:${PORT}/game         ║`);
+  console.log(`║  Health Check:  http://localhost:${PORT}/health       ║`);
+  console.log(`╠══════════════════════════════════════════════════════╣`);
+  console.log(`║  🔑 Default Admin Password: admin1234               ║`);
+  console.log(`║  ⚠️   CHANGE THE ADMIN PASSWORD IN PRODUCTION!      ║`);
+  console.log(`╠══════════════════════════════════════════════════════╣`);
+  console.log(`║  ⚡ Game Timing: ${CONFIG.COUNTDOWN_TIMER}s wait      ║`);
+  console.log(`║  🔤 BINGO Letters: B(1-15) I(16-30) N(31-45)        ║`);
+  console.log(`║            G(46-60) O(61-75)                        ║`);
+  console.log(`║  🎯 Four Corners Bonus: ${CONFIG.FOUR_CORNERS_BONUS} ETB ║`);
+  console.log(`║  💰 Commission: ${JSON.stringify(CONFIG.HOUSE_COMMISSION)} ║`);
+  console.log(`╚══════════════════════════════════════════════════════╝`);
 });
